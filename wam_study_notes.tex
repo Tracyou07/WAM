@@ -1,0 +1,217 @@
+\documentclass[11pt,a4paper]{ctexart}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\geometry{margin=2.4cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black
+}
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2em}
+
+\title{World Action Models 系统学习笔记}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{学习主线}
+
+World Action Model，简称 WAM，不只是一个会生成未来视频的模型。更严格地说，它研究的是：在部分可观测、语言条件、连续控制的序列决策问题中，如何联合建模世界动态、动作分布与任务价值，并将这种建模能力用于策略学习、规划或机器人控制。
+
+WAM 位于多个方向的交叉处：POMDP、world model、imitation learning、video prediction、diffusion policy、model-based planning 和 embodied AI。入门时应抓住一个核心问题：模型是否只需要直接输出动作，还是需要同时理解动作会如何改变世界。
+
+\section{从 POMDP 到 WAM}
+
+具身控制任务可以形式化为一个部分可观测马尔可夫决策过程：
+\[
+  \mathcal{M}=(\mathcal{S},\mathcal{A},\mathcal{O},T,\Omega,R,\gamma).
+\]
+其中 $\mathcal{S}$ 是真实状态空间，$\mathcal{A}$ 是动作空间，$\mathcal{O}$ 是观测空间，$T$ 是环境动力学，$\Omega$ 是观测模型，$R$ 是奖励函数，$\gamma$ 是折扣因子。
+
+机器人通常无法直接访问真实状态，只能得到图像、多视角视频或 proprioception。若任务由语言给出，记语言指令为 $\ell$。普通策略模型主要学习：
+\[
+  \pi_\theta(a_t\mid o_{\le t},a_{<t},\ell).
+\]
+很多 VLA 模型进一步近似为：
+\[
+  \pi_\theta(a_t\mid o_t,\ell).
+\]
+WAM 的区别在于，它不只学习动作分布，还学习动作和未来世界之间的耦合关系：
+\[
+  p_\theta(o_{t+1:t+H},a_{t:t+H-1}\mid o_{\le t},\ell).
+\]
+
+\section{World Model 与 WAM}
+
+World Model 的核心是建模世界如何演化。经典形式是：
+\[
+  p_\theta(s_{t+1}\mid s_t,a_t),
+\]
+在视觉机器人中更常写为：
+\[
+  p_\theta(o_{t+1:t+H}\mid o_{\le t},a_{t:t+H-1}).
+\]
+它回答的问题是：如果在当前世界中采取某个动作，未来世界会怎样？
+
+WAM 则更强调控制导向的联合建模：
+\[
+  p_\theta(o_{t+1:t+H},a_{t:t+H-1}\mid o_{\le t},\ell).
+\]
+也就是说，World Model 更像预测器或 learned simulator；WAM 更像带世界预测能力的动作模型。
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+模型类型 & 主要问题 & 数学对象 \\
+\midrule
+World Model & 动作之后世界如何变化 &
+$p(o_{future}\mid o_{past},a_{future})$ \\
+Policy/VLA & 当前应该做什么动作 &
+$p(a_t\mid o_t,\ell)$ \\
+WAM & 动作和未来世界如何联合建模 &
+$p(o_{future},a_{future}\mid o_{past},\ell)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Model, Planning 与 Synthetic Rollout}
+
+在 world model 和 WAM 文献中，model、planning 和 synthetic rollout 是三个相关但不等价的概念：
+\[
+  \text{model}=\text{学到的环境近似},
+\qquad
+  \text{planning}=\text{利用模型选择动作},
+\qquad
+  \text{synthetic rollout}=\text{模型内部生成的虚拟轨迹}.
+\]
+
+真实 rollout 来自真实环境：
+\[
+  \tau=(o_0,a_0,o_1,a_1,\ldots,o_T).
+\]
+Synthetic rollout 则来自学到的模型：
+\[
+  \hat{\tau}=(o_t,a_t,\hat{o}_{t+1},a_{t+1},\hat{o}_{t+2},\ldots,\hat{o}_{t+H}).
+\]
+其中未来观测由模型采样或生成，而不是由传感器真实采集。
+
+Planning 的目标是利用模型比较候选动作序列，选择期望回报最高的动作。更完整的有限时域规划还可以加入 terminal value。若模型预测 value，WAM 可以对多个候选未来进行排序，只执行得分最高候选的第一个动作或 action chunk。
+
+Synthetic rollout 的主要风险是模型误差和误差累积。单步预测可能只略有偏差，但多步展开后，预测轨迹可能逐渐偏离真实环境。此外，planner 可能利用模型漏洞，找到在模型中得分高但在真实世界不可行的动作。
+
+\section{三种 WAM 范式}
+
+\subsection{Joint Video-Action Modeling}
+
+这一范式把未来观测和动作放在同一个生成建模问题中：
+\[
+  p_\theta(o_{t+1:t+H},a_{t:t+H-1}\mid o_{\le t},\ell).
+\]
+模型同时回答两个问题：未来世界会怎样变化，哪些动作与这些未来变化相匹配。
+
+若使用扩散模型，可令干净样本为：
+\[
+  x_0=[z^o_{t+1:t+H},z^a_{t:t+H-1}],
+\]
+其中 $z^o$ 是未来视频或图像的 latent token，$z^a$ 是动作 token。条件为：
+\[
+  c=[o_{\le t},\ell].
+\]
+训练时随机加噪：
+\[
+  x_\tau=\sqrt{\bar{\alpha}_\tau}x_0+\sqrt{1-\bar{\alpha}_\tau}\epsilon,
+  \qquad \epsilon\sim\mathcal{N}(0,I).
+\]
+模型看到带噪样本、噪声等级和条件信息，任务是预测被加入的噪声：
+\[
+  \mathcal{L}_{\mathrm{joint}}
+  =
+  \mathbb{E}_{x_0,\epsilon,\tau}
+  \left[
+    \left\|
+      \epsilon-\epsilon_\theta(x_\tau,\tau,c)
+    \right\|_2^2
+  \right].
+\]
+这个目标的含义是：模型必须学会在当前观测和语言指令约束下，把被污染的“未来世界+动作”样本去噪回真实演示数据。
+
+\subsection{Imagine-Then-Execute}
+
+这一范式分成两个阶段：先想象未来，再根据未来选择动作。第一阶段生成未来观测：
+\[
+  \hat{o}_{t+1:t+H}
+  \sim
+  p_\theta(o_{t+1:t+H}\mid o_{\le t},\ell).
+\]
+第二阶段根据当前观测和想象出的未来预测动作：
+\[
+  a_{t:t+H-1}
+  \sim
+  \pi_\phi(a_{t:t+H-1}\mid o_{\le t},\hat{o}_{t+1:t+H},\ell).
+\]
+
+训练时通常包含 future model loss 和 action model loss。前者学习生成未来，后者学习从当前状态和未来状态反推出动作。它的优点是模块化清晰，缺点是测试时生成未来视频通常很慢，而且生成未来不一定对应机器人真正可执行的动作。
+
+\subsection{Fast-WAM}
+
+Fast-WAM 的核心问题是：WAM 是否必须在测试时显式生成未来视频？它的答案倾向于否。训练时仍保留视频预测目标：
+\[
+  \mathcal{L}
+  =
+  \mathcal{L}_{\mathrm{action}}
+  +
+  \lambda\mathcal{L}_{\mathrm{video}}.
+\]
+但推理时不生成未来视频，而是直接根据 latent world representation 输出动作：
+\[
+  a_{t:t+H-1}\sim \pi_\theta(a_{t:t+H-1}\mid z_t,\ell),
+  \qquad z_t=f_\theta(o_{\le t}).
+\]
+
+这里的 $z_t$ 通常由视频或视觉模型产生，但更准确地说，它是当前时刻的 latent world state。视频预测目标的作用不是为了测试时生成真实未来，而是为了迫使 $z_t$ 包含物理动态、物体交互和任务进展等控制相关信息。
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+范式 & 训练时预测未来 & 推理时生成未来 & 动作产生方式 \\
+\midrule
+Joint Video-Action & 是 & 是 & 与未来视频联合生成 \\
+Imagine-Then-Execute & 是 & 是 & 由想象未来反推动作 \\
+Fast-WAM & 是 & 否 & 由 latent representation 直接预测 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{扩散模型在 WAM 中的作用}
+
+扩散模型不是一次性输出动作或未来视频，而是学习从噪声中逐步恢复真实数据。训练时，模型拿到被加噪的真实演示片段，并学习预测噪声；推理时，模型从纯噪声开始，逐步去噪生成合理样本。
+
+在 WAM 中，被生成的对象不一定只有图像。它可以是未来视频 latent、动作 token、机器人状态 token，甚至 value token 的联合对象。因此扩散模型可以用于生成“未来世界+动作”的联合样本。
+
+Fast-WAM 之所以推理时仍可跳过扩散生成，是因为扩散或视频预测目标主要承担训练时表征学习的角色。也就是说，扩散训练让 latent 学会世界动态；推理时则只使用这个 latent 来快速预测动作。
+
+\section{三篇材料的位置}
+
+\begin{itemize}
+  \item \textbf{Fast-WAM} 适合作为 WAM 入门论文，因为它直接追问：WAM 的收益来自测试时显式未来想象，还是来自训练时视频预测塑造出的世界表征？
+  \item \textbf{Cosmos Policy} 更接近完整系统。它把 action、future state 和 value 纳入统一生成框架，并使用候选未来和价值预测辅助决策。
+  \item \textbf{WM as simulator} 更像 world model 的应用论文。它关注把 world model 作为 learned simulator，用来生成训练场景、synthetic rollout 或 synthetic data。
+\end{itemize}
+
+\section{总结}
+
+World Model 的核心是 model the world；WAM 的核心是 model the world for action。Joint Video-Action 强调动作和未来一起生成；Imagine-Then-Execute 强调先想象未来再反推动作；Fast-WAM 强调训练时学习未来、推理时直接行动。三者的根本分歧在于：未来预测到底应该作为测试时 planning 的显式步骤，还是只作为训练时塑造世界表征的辅助目标。
+
+\end{document}

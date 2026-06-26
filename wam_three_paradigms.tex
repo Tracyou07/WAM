@@ -1,0 +1,378 @@
+\documentclass[11pt,a4paper]{ctexart}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\geometry{margin=2.4cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black
+}
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2em}
+
+\title{World Action Models 的三种典型范式}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{总览}
+
+World Action Model，简称 WAM，试图把世界预测与动作生成统一起来。它不同于普通策略模型只学习
+\[
+  p(a_t\mid o_t,\ell),
+\]
+也不同于纯 world model 只学习
+\[
+  p(o_{t+1:t+H}\mid o_{\le t},a_{t:t+H-1}).
+\]
+WAM 的核心是建模动作与未来世界之间的耦合关系。典型目标可以写为：
+\[
+  p_\theta(o_{t+1:t+H},a_{t:t+H-1}\mid o_{\le t},\ell).
+\]
+
+当前 WAM 文献中可以抽象出三种代表性范式：
+\begin{enumerate}
+  \item Joint Video-Action Modeling：联合生成未来视频和动作；
+  \item Imagine-Then-Execute：先想象未来，再根据未来执行；
+  \item Fast-WAM：训练时学习未来预测，推理时跳过显式未来生成。
+\end{enumerate}
+
+\section{范式一：Joint Video-Action Modeling}
+
+\subsection{核心思想}
+
+Joint Video-Action Modeling 把未来观测和动作放在同一个生成建模问题中。模型不是先生成视频再生成动作，也不是只预测动作，而是直接学习联合分布：
+\[
+  p_\theta(o_{t+1:t+H},a_{t:t+H-1}\mid o_{\le t},\ell).
+\]
+
+直观上，模型需要同时回答两个问题：
+\begin{itemize}
+  \item 未来世界会怎样变化？
+  \item 哪些动作与这些未来变化相匹配？
+\end{itemize}
+
+这类方法强调动作和视频之间的同步建模。动作不是附加模块，而是和未来视觉 token 一起进入模型。
+
+\subsection{训练目标}
+
+训练数据来自机器人演示轨迹。每个训练样本通常包含过去观测、语言指令、未来观测和未来动作：
+\[
+  (o_{\le t},\ell,o_{t+1:t+H},a_{t:t+H-1}).
+\]
+Joint Video-Action Modeling 的目标是让模型在给定过去观测和语言指令时，同时恢复未来视觉内容和动作序列。
+
+如果使用扩散模型，可以令干净数据为：
+\[
+  x_0=[z^o_{t+1:t+H},z^a_{t:t+H-1}],
+\]
+其中 $z^o$ 是未来视频或图像的 latent token，$z^a$ 是动作 token。这里的 $x_0$ 不是单纯图像，而是“未来世界 token + 动作 token”的拼接对象。条件为：
+\[
+  c=[o_{\le t},\ell].
+\]
+训练时先随机采样一个噪声强度 $\tau$，再把高斯噪声 $\epsilon$ 加到干净样本 $x_0$ 上，得到带噪样本：
+\[
+  x_\tau=\sqrt{\bar{\alpha}_\tau}x_0+
+  \sqrt{1-\bar{\alpha}_\tau}\epsilon,
+  \qquad
+  \epsilon\sim\mathcal{N}(0,I).
+\]
+模型看到的是 $(x_\tau,\tau,c)$，任务是预测刚才加入的噪声 $\epsilon$。扩散训练目标为：
+\[
+  \mathcal{L}_{\mathrm{joint}}
+  =
+  \mathbb{E}_{x_0,\epsilon,\tau}
+  \left[
+    \left\|
+      \epsilon-\epsilon_\theta(x_\tau,\tau,c)
+    \right\|_2^2
+  \right].
+\]
+这个 loss 的含义是：模型必须学会在条件 $c$ 的约束下，把一个被污染的“未来世界+动作”样本逐步去噪回真实演示数据。训练完成后，推理时可以从纯噪声开始，反复去噪，生成与当前观测和语言指令一致的未来视觉 token 与动作 token。
+
+如果未来视觉、动作和 proprioception 的尺度差异很大，实践中常会对不同 token 使用不同编码器、归一化方式或 loss 权重：
+\[
+  \mathcal{L}_{\mathrm{joint}}
+  =
+  \lambda_o\mathcal{L}_{\mathrm{video}}
+  +
+  \lambda_a\mathcal{L}_{\mathrm{action}}
+  +
+  \lambda_q\mathcal{L}_{\mathrm{state}}.
+\]
+但概念上，它们仍然服务于同一个目标：学习一个条件联合分布，使动作和未来世界在同一个生成过程中互相约束。
+
+\subsection{推理流程}
+
+推理时，模型从噪声开始生成：
+\[
+  (\hat{o}_{t+1:t+H},\hat{a}_{t:t+H-1})
+  \sim
+  p_\theta(\cdot\mid o_{\le t},\ell).
+\]
+执行时通常只执行第一个动作或 action chunk：
+\[
+  a_t=\hat{a}_t
+  \quad \text{或} \quad
+  a_{t:t+K-1}=\hat{a}_{t:t+K-1}.
+\]
+
+\subsection{优点与问题}
+
+优点是结构统一，动作和未来观测可以互相约束。模型生成的动作天然对应某种未来世界变化，因此适合表达多模态动作分布和复杂交互。
+
+问题是推理成本较高，尤其当未来视频 token 很多时，扩散去噪会非常慢。此外，联合建模要求模型同时处理视觉、动作和语言，训练难度较高。
+
+\section{范式二：Imagine-Then-Execute}
+
+\subsection{核心思想}
+
+Imagine-Then-Execute 把 WAM 分成两个阶段：
+\[
+  \text{先想象未来，再根据未来选择动作。}
+\]
+第一阶段生成未来观测：
+\[
+  \hat{o}_{t+1:t+H}
+  \sim
+  p_\theta(o_{t+1:t+H}\mid o_{\le t},\ell).
+\]
+第二阶段根据当前观测和想象出的未来预测动作：
+\[
+  a_{t:t+H-1}
+  \sim
+  \pi_\phi(a_{t:t+H-1}\mid o_{\le t},\hat{o}_{t+1:t+H},\ell).
+\]
+
+它的直觉是：如果模型能想象任务成功的未来状态，那么动作模型可以学习如何到达这个未来。
+
+\subsection{与 inverse dynamics 的关系}
+
+第二阶段常常接近 inverse dynamics problem。Forward dynamics 问：
+\[
+  (o_t,a_t)\mapsto o_{t+1}.
+\]
+Inverse dynamics 问：
+\[
+  (o_t,o_{t+1})\mapsto a_t.
+\]
+Imagine-Then-Execute 可以看作先生成目标未来，再用 inverse dynamics 或 action decoder 反推出动作。
+
+\subsection{训练目标}
+
+Imagine-Then-Execute 通常把训练拆成两个目标。第一部分训练 future model，使其根据过去观测和语言指令生成未来观测：
+\[
+  \mathcal{L}_{\mathrm{future}}
+  =
+  -\log p_\theta(o_{t+1:t+H}\mid o_{\le t},\ell).
+\]
+如果 future model 是扩散视频模型，这个负对数似然通常也通过 denoising loss 近似：模型学习从带噪未来视频 token 中预测噪声。
+
+第二部分训练 action model，使其根据当前观测和未来观测恢复动作：
+\[
+  \mathcal{L}_{\mathrm{action}}
+  =
+  -\log \pi_\phi(a_{t:t+H-1}\mid o_{\le t},o_{t+1:t+H},\ell).
+\]
+在训练时，这里的未来观测通常使用真实演示中的未来帧，而不是模型生成的未来帧。这样 action model 学到的是：如果当前状态和目标未来都给定，哪些动作能连接二者。
+
+总训练目标可以写成：
+\[
+  \mathcal{L}
+  =
+  \mathcal{L}_{\mathrm{future}}
+  +
+  \beta\mathcal{L}_{\mathrm{action}}.
+\]
+因此，这一范式的训练逻辑是“先学会想象未来，再学会从未来反推动作”。它的风险在于训练时 action model 看到的未来是真实未来，推理时看到的未来却是生成未来，两者分布可能不完全一致。
+
+\subsection{Planning 形式}
+
+如果生成多个未来候选：
+\[
+  \hat{o}^{(i)}_{t+1:t+H}\sim p_\theta,
+  \qquad i=1,\ldots,N,
+\]
+可以用 reward model 或 value model 评分：
+\[
+  J^{(i)}=\hat{V}_\psi(\hat{o}^{(i)}_{t+H}).
+\]
+选择：
+\[
+  i^*=\arg\max_i J^{(i)}.
+\]
+再由动作模型生成对应动作：
+\[
+  a_{t:t+H-1}
+  \sim
+  \pi_\phi(\cdot\mid o_{\le t},\hat{o}^{(i^*)}_{t+1:t+H},\ell).
+\]
+
+\subsection{优点与问题}
+
+优点是模块化清晰：视频模型负责未来想象，动作模型负责执行。这种结构便于利用大规模预训练视频模型，也便于在未来空间中做候选选择。
+
+问题是显式 future imagination 很慢，尤其是视频扩散模型需要多步 denoising。另一个问题是 generated future 和 executable action 之间可能不一致：模型可能想象出看起来合理但机器人实际上难以实现的未来。
+
+\section{范式三：Fast-WAM}
+
+\subsection{核心思想}
+
+Fast-WAM 的出发点是质疑一个常见假设：WAM 是否必须在测试时显式生成未来视频？
+
+它将训练和推理解耦。训练时保留视频预测目标：
+\[
+  \mathcal{L}
+  =
+  \mathcal{L}_{\mathrm{action}}
+  +
+  \lambda\mathcal{L}_{\mathrm{video}}.
+\]
+但推理时不生成未来视频，而是直接根据当前观测的 latent representation 输出动作：
+\[
+  a_{t:t+H-1}
+  \sim
+  \pi_\theta(a_{t:t+H-1}\mid z_t,\ell),
+  \qquad
+  z_t=f_\theta(o_{\le t}).
+\]
+
+\subsection{训练阶段}
+
+训练时模型仍然学习 future prediction：
+\[
+  p_\theta(o_{t+1:t+H}\mid o_{\le t},a_{t:t+H-1},\ell),
+\]
+或在 latent space 中预测未来视频 token。该目标迫使模型学习物理动态、运动规律和任务相关时间结构。
+
+同时，模型学习动作预测：
+\[
+  p_\theta(a_{t:t+H-1}\mid o_{\le t},\ell).
+\]
+因此视频预测在这里主要是 representation learning 的辅助目标。
+
+更具体地说，Fast-WAM 的训练目标可以拆成两部分。第一部分是动作预测：
+\[
+  \mathcal{L}_{\mathrm{action}}
+  =
+  -\log p_\theta(a_{t:t+H-1}\mid z_t,\ell),
+  \qquad
+  z_t=f_\theta(o_{\le t}).
+\]
+第二部分是视频预测或视频 denoising：
+\[
+  \mathcal{L}_{\mathrm{video}}
+  =
+  -\log p_\theta(o_{t+1:t+H}\mid z_t,a_{t:t+H-1},\ell),
+\]
+或其扩散形式。总目标为：
+\[
+  \mathcal{L}
+  =
+  \mathcal{L}_{\mathrm{action}}
+  +
+  \lambda\mathcal{L}_{\mathrm{video}}.
+\]
+
+这里最重要的是 $\mathcal{L}_{\mathrm{video}}$ 的角色变化。它不是为了让模型在测试时真的生成未来视频，而是作为辅助监督，迫使 $z_t$ 包含对物理动态、物体交互和任务进展有用的信息。换言之，Fast-WAM 把视频预测从“推理步骤”降级为“训练时的表征学习约束”。
+
+\subsection{推理阶段}
+
+推理时，模型不再执行：
+\[
+  \hat{o}_{t+1:t+H}\sim p_\theta.
+\]
+它只使用视频模型或 world encoder 提供的 latent state：
+\[
+  z_t=f_\theta(o_{\le t}),
+\]
+然后由 action head 或 action expert 生成动作：
+\[
+  \hat{a}_{t:t+H-1}=g_\theta(z_t,\ell).
+\]
+
+\subsection{关键假设}
+
+Fast-WAM 的核心假设是：
+\[
+  \text{WAM 的主要收益来自训练时的视频预测目标，而不是测试时显式生成未来。}
+\]
+换句话说，未来预测的作用是塑造更好的世界表征，而不一定要在推理时真的把未来视频生成出来。
+
+\subsection{优点与问题}
+
+优点是推理速度快，避免了测试时视频扩散的高延迟。它更适合 real-time control，尤其是机器人任务中控制频率有限、延迟敏感。
+
+问题是它牺牲了显式 planning 的能力。模型不能在测试时比较多个想象未来，也较难利用 value ranking 做 best-of-$N$ 搜索。因此它更像一个被 world-model training 强化过的 policy，而不是完整的 model-based planner。
+
+\section{三种范式对比}
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+范式 & 训练时是否预测未来 & 推理时是否生成未来 & 动作如何产生 \\
+\midrule
+Joint Video-Action & 是 & 是 & 与未来视频联合生成 \\
+Imagine-Then-Execute & 是 & 是 & 由想象未来反推出动作 \\
+Fast-WAM & 是 & 否 & 由 latent representation 直接预测 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+从建模角度看：
+\[
+  \text{Joint Video-Action}
+  :
+  p(o_{future},a_{future}\mid o_{past},\ell).
+\]
+\[
+  \text{Imagine-Then-Execute}
+  :
+  p(o_{future}\mid o_{past},\ell)
+  \quad \text{then} \quad
+  p(a_{future}\mid o_{past},o_{future},\ell).
+\]
+\[
+  \text{Fast-WAM}
+  :
+  \mathcal{L}_{video}\text{ for training},
+  \quad
+  p(a_{future}\mid z_t,\ell)\text{ for inference}.
+\]
+
+\section{如何阅读相关论文}
+
+阅读一篇 WAM 论文时，应先判断它属于哪种范式。可以依次追问：
+\begin{enumerate}
+  \item 动作和未来视频是联合生成，还是分阶段生成？
+  \item 视频预测只用于训练，还是也用于测试时决策？
+  \item 推理时是否显式生成未来图像或视频？
+  \item 是否使用 value function 对未来候选排序？
+  \item 动作是单步输出，还是 action chunk？
+  \item 延迟瓶颈来自视频生成、动作扩散，还是多候选采样？
+\end{enumerate}
+
+\section{与三篇材料的对应}
+
+\begin{itemize}
+  \item Fast-WAM 对应第三种范式。它的贡献在于证明或至少经验性支持：训练时的视频建模可能比测试时显式未来想象更关键。
+  \item Cosmos Policy 更接近联合建模与 planning 的组合。它把 action、future state 和 value 放入统一生成框架，并用候选未来与价值预测辅助决策。
+  \item WM as simulator 不是典型 WAM 入门论文。它更关注把 world model 作为 learned simulator，用来生成训练场景或 synthetic data。
+\end{itemize}
+
+\section{一句话总结}
+
+Joint Video-Action 的核心是“动作和未来一起生成”；Imagine-Then-Execute 的核心是“先想象未来，再反推动作”；Fast-WAM 的核心是“训练时学习未来，推理时直接行动”。
+
+三者的根本分歧在于：未来预测到底应该作为测试时 planning 的显式步骤，还是只作为训练时塑造世界表征的辅助目标。
+
+\end{document}
