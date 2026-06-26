@@ -1,22 +1,21 @@
-# WAM Study Notes
+# WAM
 
-This repository contains study notes and reference papers for World Models and World Action Models.
+This repository collects Chinese study notes and reference papers for World Models and World Action Models.
 
-## Main Notes
+## Notes
 
-- `wam_study_notes.pdf`: consolidated Chinese study notes.
-- `wam_study_notes.tex`: LaTeX source for the consolidated notes.
+The organized PDFs are in `note/`:
 
-## Supporting Notes
+- `01_wam_foundations.pdf`: WAM mathematical foundations and World Model vs WAM.
+- `02_model_planning_and_synthetic_rollout.pdf`: model-based planning and synthetic rollout.
+- `03_wam_three_paradigms.pdf`: three WAM paradigms and their training/inference differences.
 
-- `wam_math_notes.*`: mathematical introduction to WAM.
-- `wm_vs_wam_notes.*`: comparison between World Models and WAM.
-- `model_planning_synthetic_rollout.*`: notes on model-based planning and synthetic rollout.
-- `wam_three_paradigms.*`: notes on three WAM paradigms.
+Original individual note PDFs are kept in `note/source/`.
 
-## Reference Papers
+## Papers
 
-- `2601.16163v1.pdf`: Cosmos Policy.
-- `2603.16666v2.pdf`: Fast-WAM.
-- `WM as simulator.pdf`: world model as simulator reference.
+Reference papers are in `paper/` with readable filenames:
+
+- `Cosmos_Policy_Fine_Tuning_Video_Models_for_Visuomotor_Control_and_Planning.pdf`
+- `Fast_WAM_Do_World_Action_Models_Need_Test_Time_Future_Imagination.pdf`
 

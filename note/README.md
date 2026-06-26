@@ -1,0 +1,13 @@
+# WAM Study Notes
+
+This directory contains organized Chinese study notes for World Models and World Action Models.
+
+## Organized PDFs
+
+- `01_wam_foundations.pdf`: WAM mathematical foundations and World Model vs WAM.
+- `02_model_planning_and_synthetic_rollout.pdf`: model-based planning and synthetic rollout.
+- `03_wam_three_paradigms.pdf`: three WAM paradigms, including Joint Video-Action, Imagine-Then-Execute, and Fast-WAM.
+
+## Source PDFs
+
+The original individual note PDFs are kept under `source/` for traceability.
