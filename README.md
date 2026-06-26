@@ -22,6 +22,10 @@ python -m http.server 8091 --bind 127.0.0.1
 
 Then visit `http://127.0.0.1:8091/web/index.html`.
 
+## Presentation
+
+- `presentation/World_Action_Models_Academic_Report.pptx`: academic presentation deck for the WAM learning report.
+
 ## Papers
 
 Reference papers are in `paper/` with readable filenames:
