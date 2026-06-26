@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WAM 学习汇报</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#overview" aria-label="返回概览">
+      <span class="brand-mark">WAM</span>
+      <span class="brand-text">World Action Models 学习汇报</span>
+    </a>
+    <nav class="nav" aria-label="页面导航">
+      <a href="#overview">概览</a>
+      <a href="#route">路线</a>
+      <a href="#notes">笔记</a>
+      <a href="#reader">阅读器</a>
+    </nav>
+  </header>
+
+  <main>
+    <section id="overview" class="hero">
+      <div class="hero-copy">
+        <p class="kicker">World Models · WAM · Planning · Diffusion</p>
+        <h1>从世界建模到动作决策</h1>
+        <p class="hero-text">
+          这份网页把 `note/source` 中的学习笔记整理成一个汇报式阅读入口：
+          先建立数学基础，再理解 model-based planning，最后比较三种 WAM 范式。
+        </p>
+        <div class="hero-actions">
+          <a class="primary-action" href="#notes">查看笔记</a>
+          <a class="secondary-action" href="../note/01_wam_foundations.pdf" target="_blank" rel="noreferrer">打开整理版 PDF</a>
+        </div>
+      </div>
+      <div class="hero-map" aria-label="学习主线示意">
+        <div class="map-node active">POMDP</div>
+        <div class="map-line"></div>
+        <div class="map-node">World Model</div>
+        <div class="map-line"></div>
+        <div class="map-node">Synthetic Rollout</div>
+        <div class="map-line"></div>
+        <div class="map-node strong">WAM</div>
+      </div>
+    </section>
+
+    <section id="route" class="section route-section">
+      <div class="section-heading">
+        <p class="kicker">Reading Route</p>
+        <h2>推荐阅读顺序</h2>
+      </div>
+      <ol class="timeline">
+        <li>
+          <span class="step-index">01</span>
+          <div>
+            <h3>WAM 数学基础</h3>
+            <p>从 POMDP、观测、动作、语言条件和联合分布开始，建立严格的问题定义。</p>
+          </div>
+        </li>
+        <li>
+          <span class="step-index">02</span>
+          <div>
+            <h3>World Model 与 WAM</h3>
+            <p>区分“建模世界如何演化”和“为动作决策建模世界”的差异。</p>
+          </div>
+        </li>
+        <li>
+          <span class="step-index">03</span>
+          <div>
+            <h3>Model, Planning, Synthetic Rollout</h3>
+            <p>理解模型内部虚拟轨迹如何用于动作选择，以及 Bellman 思想如何进入 planning。</p>
+          </div>
+        </li>
+        <li>
+          <span class="step-index">04</span>
+          <div>
+            <h3>三种 WAM 范式</h3>
+            <p>比较 Joint Video-Action、Imagine-Then-Execute 和 Fast-WAM 的训练与推理差异。</p>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section class="section comparison">
+      <div class="section-heading">
+        <p class="kicker">Core Contrast</p>
+        <h2>三个关键区分</h2>
+      </div>
+      <div class="contrast-grid">
+        <article>
+          <span>World Model</span>
+          <h3>建模世界</h3>
+          <p>关注给定动作后环境如何变化，常用于未来预测、模拟展开和 model-based planning。</p>
+        </article>
+        <article>
+          <span>WAM</span>
+          <h3>为动作建模世界</h3>
+          <p>把未来世界和动作放进同一个控制问题中，目标是让世界表征服务于动作生成。</p>
+        </article>
+        <article>
+          <span>Fast-WAM</span>
+          <h3>训练时想象，推理时行动</h3>
+          <p>保留视频预测作为表征学习约束，但测试时跳过显式未来视频生成以降低延迟。</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="notes" class="section notes-section">
+      <div class="section-heading">
+        <p class="kicker">Source Notes</p>
+        <h2>笔记材料</h2>
+      </div>
+      <div class="note-grid" id="noteGrid"></div>
+    </section>
+
+    <section id="reader" class="reader-section">
+      <div class="reader-header">
+        <div>
+          <p class="kicker">PDF Reader</p>
+          <h2 id="readerTitle">WAM 数学化学习笔记</h2>
+        </div>
+        <a id="openPdf" class="secondary-action" href="../note/source/wam_math_notes.pdf" target="_blank" rel="noreferrer">新窗口打开</a>
+      </div>
+      <iframe id="pdfFrame" title="PDF 阅读器" src="../note/source/wam_math_notes.pdf"></iframe>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
