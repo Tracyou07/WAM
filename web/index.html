@@ -3,126 +3,264 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WAM 学习汇报</title>
+  <title>World Action Models 学术汇报</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="#overview" aria-label="返回概览">
+    <a class="brand" href="#abstract">
       <span class="brand-mark">WAM</span>
-      <span class="brand-text">World Action Models 学习汇报</span>
+      <span class="brand-title">World Action Models</span>
     </a>
     <nav class="nav" aria-label="页面导航">
-      <a href="#overview">概览</a>
-      <a href="#route">路线</a>
-      <a href="#notes">笔记</a>
-      <a href="#reader">阅读器</a>
+      <a href="#problem">问题</a>
+      <a href="#framework">框架</a>
+      <a href="#paradigms">范式</a>
+      <a href="#diffusion">扩散</a>
+      <a href="#route">汇报路线</a>
+      <a href="#references">资料</a>
     </nav>
   </header>
 
   <main>
-    <section id="overview" class="hero">
-      <div class="hero-copy">
-        <p class="kicker">World Models · WAM · Planning · Diffusion</p>
-        <h1>从世界建模到动作决策</h1>
-        <p class="hero-text">
-          这份网页把 `note/source` 中的学习笔记整理成一个汇报式阅读入口：
-          先建立数学基础，再理解 model-based planning，最后比较三种 WAM 范式。
+    <section id="abstract" class="hero">
+      <div class="hero-main">
+        <p class="eyebrow">Academic Report · Embodied AI · World Models</p>
+        <h1>World Action Models：从世界建模到动作生成</h1>
+        <p class="lead">
+          本汇报的核心观点是：WAM 不是“视频生成模型加一个动作头”，而是一类试图把
+          <strong>世界动态表征</strong>、<strong>动作分布</strong>与<strong>规划价值</strong>
+          放入同一序列决策问题中的模型范式。
         </p>
-        <div class="hero-actions">
-          <a class="primary-action" href="#notes">查看笔记</a>
-          <a class="secondary-action" href="../note/01_wam_foundations.pdf" target="_blank" rel="noreferrer">打开整理版 PDF</a>
-        </div>
       </div>
-      <div class="hero-map" aria-label="学习主线示意">
-        <div class="map-node active">POMDP</div>
-        <div class="map-line"></div>
-        <div class="map-node">World Model</div>
-        <div class="map-line"></div>
-        <div class="map-node">Synthetic Rollout</div>
-        <div class="map-line"></div>
-        <div class="map-node strong">WAM</div>
-      </div>
+      <aside class="thesis-panel">
+        <span class="panel-label">Central Thesis</span>
+        <p>
+          World Model 解决“世界如何演化”；WAM 进一步追问“为了完成任务，动作与未来世界应如何联合建模”。
+        </p>
+      </aside>
     </section>
 
-    <section id="route" class="section route-section">
-      <div class="section-heading">
-        <p class="kicker">Reading Route</p>
-        <h2>推荐阅读顺序</h2>
-      </div>
-      <ol class="timeline">
-        <li>
-          <span class="step-index">01</span>
-          <div>
-            <h3>WAM 数学基础</h3>
-            <p>从 POMDP、观测、动作、语言条件和联合分布开始，建立严格的问题定义。</p>
-          </div>
-        </li>
-        <li>
-          <span class="step-index">02</span>
-          <div>
-            <h3>World Model 与 WAM</h3>
-            <p>区分“建模世界如何演化”和“为动作决策建模世界”的差异。</p>
-          </div>
-        </li>
-        <li>
-          <span class="step-index">03</span>
-          <div>
-            <h3>Model, Planning, Synthetic Rollout</h3>
-            <p>理解模型内部虚拟轨迹如何用于动作选择，以及 Bellman 思想如何进入 planning。</p>
-          </div>
-        </li>
-        <li>
-          <span class="step-index">04</span>
-          <div>
-            <h3>三种 WAM 范式</h3>
-            <p>比较 Joint Video-Action、Imagine-Then-Execute 和 Fast-WAM 的训练与推理差异。</p>
-          </div>
-        </li>
-      </ol>
-    </section>
-
-    <section class="section comparison">
-      <div class="section-heading">
-        <p class="kicker">Core Contrast</p>
-        <h2>三个关键区分</h2>
-      </div>
-      <div class="contrast-grid">
-        <article>
+    <section id="problem" class="paper-section">
+      <div class="section-index">01</div>
+      <div class="section-body">
+        <p class="eyebrow">Problem Formulation</p>
+        <h2>为什么不能只学 observation 到 action</h2>
+        <p>
+          在具身控制中，智能体面对的是部分可观测环境。视觉观测只能给出当前场景的投影，
+          但动作的好坏取决于它如何改变未来世界。直接策略模型可以学习从图像和语言到动作的映射，
+          但它未必显式约束模型理解接触、遮挡、物体运动和任务进展。
+        </p>
+        <p>
+          因此，WAM 的学习路线应从序列决策出发：当前观测不是终点，而是推断隐藏世界状态的证据；
+          动作不是孤立输出，而是会改变未来观测分布的干预变量。
+        </p>
+        <div class="formula-block">
+          <span>Policy / VLA</span>
+          <code>p(action | observation, language)</code>
           <span>World Model</span>
-          <h3>建模世界</h3>
-          <p>关注给定动作后环境如何变化，常用于未来预测、模拟展开和 model-based planning。</p>
-        </article>
-        <article>
+          <code>p(future observation | past observation, action)</code>
           <span>WAM</span>
-          <h3>为动作建模世界</h3>
-          <p>把未来世界和动作放进同一个控制问题中，目标是让世界表征服务于动作生成。</p>
-        </article>
-        <article>
-          <span>Fast-WAM</span>
-          <h3>训练时想象，推理时行动</h3>
-          <p>保留视频预测作为表征学习约束，但测试时跳过显式未来视频生成以降低延迟。</p>
-        </article>
-      </div>
-    </section>
-
-    <section id="notes" class="section notes-section">
-      <div class="section-heading">
-        <p class="kicker">Source Notes</p>
-        <h2>笔记材料</h2>
-      </div>
-      <div class="note-grid" id="noteGrid"></div>
-    </section>
-
-    <section id="reader" class="reader-section">
-      <div class="reader-header">
-        <div>
-          <p class="kicker">PDF Reader</p>
-          <h2 id="readerTitle">WAM 数学化学习笔记</h2>
+          <code>p(future observation, future action | past observation, language)</code>
         </div>
-        <a id="openPdf" class="secondary-action" href="../note/source/wam_math_notes.pdf" target="_blank" rel="noreferrer">新窗口打开</a>
       </div>
-      <iframe id="pdfFrame" title="PDF 阅读器" src="../note/source/wam_math_notes.pdf"></iframe>
+    </section>
+
+    <section id="framework" class="paper-section tinted">
+      <div class="section-index">02</div>
+      <div class="section-body">
+        <p class="eyebrow">Conceptual Framework</p>
+        <h2>World Model 与 WAM 的概念边界</h2>
+        <div class="two-column">
+          <article>
+            <h3>World Model</h3>
+            <p>
+              World Model 的主要对象是环境动力学。它把动作作为条件，预测世界随后如何变化。
+              在传统控制中，这对应运动方程、观测模型和状态估计；在神经模型中，这些结构被压缩进 latent representation。
+            </p>
+          </article>
+          <article>
+            <h3>World Action Model</h3>
+            <p>
+              WAM 将动作从“给定条件”提升为“建模对象”。它不只问某个动作会导致什么未来，
+              还问在任务条件下哪些动作与哪些未来状态共同构成高概率或高价值轨迹。
+            </p>
+          </article>
+        </div>
+        <table class="academic-table">
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>核心问题</th>
+              <th>动作的角色</th>
+              <th>典型用途</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>World Model</td>
+              <td>动作之后世界如何变化</td>
+              <td>条件变量</td>
+              <td>预测、仿真、rollout</td>
+            </tr>
+            <tr>
+              <td>Policy / VLA</td>
+              <td>当前应该执行什么动作</td>
+              <td>输出变量</td>
+              <td>直接控制</td>
+            </tr>
+            <tr>
+              <td>WAM</td>
+              <td>动作与未来世界如何联合产生</td>
+              <td>条件相关且可生成</td>
+              <td>控制、规划、表征学习</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="planning" class="paper-section">
+      <div class="section-index">03</div>
+      <div class="section-body">
+        <p class="eyebrow">Model-Based Reasoning</p>
+        <h2>Model、Planning 与 Synthetic Rollout</h2>
+        <p>
+          学到的 model 是一个可查询的近似环境；synthetic rollout 是在这个近似环境中展开出的虚拟未来；
+          planning 则是用这些虚拟未来比较候选动作。三者的关系不是并列，而是逐层依赖。
+        </p>
+        <div class="process">
+          <div>
+            <span>1</span>
+            <h3>Learned Model</h3>
+            <p>从真实数据中学习动作条件下的未来预测。</p>
+          </div>
+          <div>
+            <span>2</span>
+            <h3>Synthetic Rollout</h3>
+            <p>在模型内部生成多条可能未来轨迹。</p>
+          </div>
+          <div>
+            <span>3</span>
+            <h3>Planning</h3>
+            <p>根据回报或 value 对候选未来排序，并执行最优动作。</p>
+          </div>
+        </div>
+        <p class="note">
+          这里的 planning 与 Bellman 思想一致：动作价值由当前收益和后继状态的未来价值共同决定。
+          但 WAM 是否真正“使用 Bellman”，取决于它是否显式建模 reward、return、value 或 Q function。
+        </p>
+      </div>
+    </section>
+
+    <section id="paradigms" class="paper-section tinted">
+      <div class="section-index">04</div>
+      <div class="section-body">
+        <p class="eyebrow">Three Paradigms</p>
+        <h2>三种 WAM 范式的核心差异</h2>
+        <div class="paradigm-grid">
+          <article>
+            <span class="tag">Paradigm A</span>
+            <h3>Joint Video-Action Modeling</h3>
+            <p>
+              将未来视觉 token 与动作 token 作为同一个生成对象。优点是动作和未来相互约束；
+              代价是推理通常需要生成高维未来内容，计算开销较高。
+            </p>
+          </article>
+          <article>
+            <span class="tag">Paradigm B</span>
+            <h3>Imagine-Then-Execute</h3>
+            <p>
+              先生成目标未来，再由动作模型或 inverse dynamics 反推出动作。结构清晰，
+              但生成未来和可执行动作之间可能存在分布错配。
+            </p>
+          </article>
+          <article>
+            <span class="tag">Paradigm C</span>
+            <h3>Fast-WAM</h3>
+            <p>
+              训练时保留视频预测目标，推理时不显式生成未来视频。它将 future prediction
+              从测试时规划步骤转化为训练时的表征学习约束。
+            </p>
+          </article>
+        </div>
+        <div class="claim">
+          <strong>关键分歧：</strong>
+          WAM 的收益究竟来自测试时显式 imagination，还是来自训练时视频预测所塑造的 latent world representation？
+        </div>
+      </div>
+    </section>
+
+    <section id="diffusion" class="paper-section">
+      <div class="section-index">05</div>
+      <div class="section-body">
+        <p class="eyebrow">Diffusion Objective</p>
+        <h2>扩散模型在这里不是“画图工具”</h2>
+        <p>
+          在 WAM 语境中，扩散模型的生成对象可以不是图像本身，而是未来视觉 latent、动作 token、
+          proprioception token 甚至 value token 的联合表示。训练时，模型学习从带噪的联合样本中恢复真实演示轨迹。
+        </p>
+        <div class="definition-list">
+          <div>
+            <dt>干净样本</dt>
+            <dd>未来世界表示与动作表示的拼接，例如 future visual latent + action token。</dd>
+          </div>
+          <div>
+            <dt>条件信息</dt>
+            <dd>过去观测、语言指令、机器人状态等上下文。</dd>
+          </div>
+          <div>
+            <dt>训练任务</dt>
+            <dd>预测加入到样本中的噪声，从而学会条件去噪。</dd>
+          </div>
+          <div>
+            <dt>控制意义</dt>
+            <dd>不是为了生成漂亮视频，而是为了学习多峰、动作相关、物理一致的未来分布。</dd>
+          </div>
+        </div>
+        <p class="note">
+          Fast-WAM 的重要性在于：它保留扩散/视频预测带来的表征学习收益，但在推理阶段不再支付显式未来生成的延迟成本。
+        </p>
+      </div>
+    </section>
+
+    <section id="route" class="paper-section tinted">
+      <div class="section-index">06</div>
+      <div class="section-body">
+        <p class="eyebrow">Report Structure</p>
+        <h2>建议汇报路线</h2>
+        <ol class="report-route">
+          <li>
+            <span>第一部分</span>
+            <h3>从 POMDP 引入问题</h3>
+            <p>说明具身控制为什么不能只看当前图像到动作的静态映射。</p>
+          </li>
+          <li>
+            <span>第二部分</span>
+            <h3>界定 World Model 与 WAM</h3>
+            <p>强调动作变量在二者中的角色差异：条件变量、输出变量、联合建模变量。</p>
+          </li>
+          <li>
+            <span>第三部分</span>
+            <h3>解释 planning 与 synthetic rollout</h3>
+            <p>把 model-based reasoning 和 Bellman/value 思想连接起来。</p>
+          </li>
+          <li>
+            <span>第四部分</span>
+            <h3>比较三种 WAM 范式</h3>
+            <p>最后落到 Fast-WAM 的问题意识：未来想象是否必须发生在测试时？</p>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section id="references" class="references">
+      <div class="section-heading">
+        <p class="eyebrow">Appendix</p>
+        <h2>参考笔记</h2>
+        <p>以下 PDF 是本汇报的素材来源，不作为页面主体照搬。</p>
+      </div>
+      <div class="reference-grid" id="referenceGrid"></div>
     </section>
   </main>
 
