@@ -1,0 +1,419 @@
+\documentclass[11pt,a4paper]{ctexart}
+
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+
+\geometry{margin=2.35cm}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black
+}
+\setlist[itemize]{leftmargin=2em}
+\setlist[enumerate]{leftmargin=2em}
+
+\title{自回归、扩散、流匹配与一致性模型：底层公式对比}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{统一问题：从简单随机性到复杂数据}
+
+四类模型都在解决同一个生成问题：给定数据分布 \(p_{\mathrm{data}}(x)\)，学习一个模型分布 \(p_\theta(x)\)，使得
+\[
+  p_\theta(x)\approx p_{\mathrm{data}}(x).
+\]
+如果有条件信息 \(c\)，例如文本、图像观测、机器人状态或语言指令，则目标变成：
+\[
+  p_\theta(x\mid c)\approx p_{\mathrm{data}}(x\mid c).
+\]
+
+在 WAM 或机器人策略中，\(x\) 可以不是图像，而是一段联合对象：
+\[
+  x=[z^o_{t+1:t+H},a_{t:t+H-1}],
+\]
+其中 \(z^o\) 是未来视频 latent，\(a\) 是动作 chunk。四种生成范式的差别在于：它们如何表示 \(p_\theta(x)\)，训练时拟合什么对象，推理时如何采样。
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+范式 & 分布建模方式 & 训练信号 & 推理方式 \\
+\midrule
+自回归 & 条件概率链式分解 & 下一个 token 似然 & 串行采样 \\
+扩散 & 反向去噪马尔可夫链 & 噪声/score/clean data & 多步去噪 \\
+流匹配 & 连续时间速度场 & 速度向量场 & ODE 积分 \\
+一致性 & 跨时间一致映射 & 同一轨道输出一致 & 一步或少步采样 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{自回归模型：概率链式分解}
+
+\subsection{基本分解}
+
+设数据是长度为 \(T\) 的序列：
+\[
+  x=(x_1,x_2,\ldots,x_T).
+\]
+自回归模型使用概率链式法则：
+\[
+  p_\theta(x)=\prod_{t=1}^{T}p_\theta(x_t\mid x_{<t}).
+\]
+如果有条件 \(c\)，则为：
+\[
+  p_\theta(x\mid c)=\prod_{t=1}^{T}p_\theta(x_t\mid x_{<t},c).
+\]
+
+这不是近似，而是任意联合分布都可以这样分解。模型近似发生在每个条件分布 \(p_\theta(x_t\mid x_{<t},c)\) 上。
+
+\subsection{训练目标}
+
+训练数据为 \(\mathcal{D}=\{x^{(i)}\}_{i=1}^N\)。最大似然训练为：
+\[
+  \max_\theta \sum_{i=1}^{N}\log p_\theta(x^{(i)}).
+\]
+等价于最小化负对数似然：
+\[
+  \mathcal{L}_{\mathrm{AR}}(\theta)
+  =
+  -\mathbb{E}_{x\sim p_{\mathrm{data}}}
+  \sum_{t=1}^{T}
+  \log p_\theta(x_t\mid x_{<t}).
+\]
+对于离散 token，若模型输出 logits 并经过 softmax，则该目标就是交叉熵损失。
+
+\subsection{Teacher Forcing 与 Exposure Bias}
+
+训练时，第 \(t\) 步条件使用真实前缀 \(x_{<t}\)，称为 teacher forcing：
+\[
+  p_\theta(x_t\mid x_1,\ldots,x_{t-1}).
+\]
+推理时，条件使用模型自己生成的前缀：
+\[
+  \hat{x}_t\sim p_\theta(x_t\mid \hat{x}_{<t}).
+\]
+因此训练分布与推理分布不同。早期错误会进入后续条件，造成误差累积，这常被称为 exposure bias。
+
+\subsection{适用性}
+
+自回归适合天然离散且有顺序的数据，例如文本 token、代码 token、离散化图像 token。对于连续动作或整段轨迹，自回归也可以用，但通常需要离散化或假设特定连续分布，并且采样是串行的：
+\[
+  x_1\rightarrow x_2\rightarrow \cdots \rightarrow x_T.
+\]
+
+\section{扩散模型：从数据到噪声，再从噪声回数据}
+
+\subsection{前向加噪过程}
+
+扩散模型构造一个固定的前向过程，把数据 \(x_0\sim p_{\mathrm{data}}\) 逐渐加噪到近似高斯噪声。离散时间 DDPM 常写为：
+\[
+  q(x_t\mid x_{t-1})
+  =
+  \mathcal{N}\left(
+    x_t;
+    \sqrt{1-\beta_t}x_{t-1},
+    \beta_t I
+  \right).
+\]
+令
+\[
+  \alpha_t=1-\beta_t,\qquad
+  \bar{\alpha}_t=\prod_{s=1}^{t}\alpha_s.
+\]
+则可以直接从 \(x_0\) 采样任意时刻：
+\[
+  q(x_t\mid x_0)
+  =
+  \mathcal{N}
+  \left(
+    x_t;
+    \sqrt{\bar{\alpha}_t}x_0,
+    (1-\bar{\alpha}_t)I
+  \right),
+\]
+即：
+\[
+  x_t=\sqrt{\bar{\alpha}_t}x_0+\sqrt{1-\bar{\alpha}_t}\epsilon,
+  \qquad
+  \epsilon\sim\mathcal{N}(0,I).
+\]
+
+\subsection{反向去噪过程}
+
+生成时需要学习反向分布：
+\[
+  p_\theta(x_{t-1}\mid x_t).
+\]
+直观上，模型看到带噪样本 \(x_t\)，需要判断如何去掉噪声，回到更干净的 \(x_{t-1}\)。
+
+常见训练目标是预测噪声：
+\[
+  \mathcal{L}_{\epsilon}
+  =
+  \mathbb{E}_{x_0,\epsilon,t}
+  \left[
+    \left\|
+      \epsilon-\epsilon_\theta(x_t,t)
+    \right\|_2^2
+  \right].
+\]
+如果有条件 \(c\)，则为：
+\[
+  \mathcal{L}_{\epsilon}
+  =
+  \mathbb{E}_{x_0,\epsilon,t}
+  \left[
+    \left\|
+      \epsilon-\epsilon_\theta(x_t,t,c)
+    \right\|_2^2
+  \right].
+\]
+
+\subsection{Score 的角度}
+
+扩散也可以理解为学习 score：
+\[
+  \nabla_{x_t}\log q_t(x_t).
+\]
+在高斯加噪条件下，噪声预测与 score 有关系：
+\[
+  \nabla_{x_t}\log q(x_t\mid x_0)
+  =
+  -\frac{\epsilon}{\sqrt{1-\bar{\alpha}_t}}.
+\]
+所以预测噪声、预测 score、预测 clean data \(x_0\) 之间可以互相转换。
+
+\subsection{采样代价}
+
+扩散生成通常从
+\[
+  x_T\sim\mathcal{N}(0,I)
+\]
+开始，经过多步反向过程：
+\[
+  x_T\rightarrow x_{T-1}\rightarrow\cdots\rightarrow x_0.
+\]
+优点是可以建模复杂、多峰、高维分布；缺点是推理步数较多。
+
+\section{流匹配：学习从噪声到数据的速度场}
+
+\subsection{概率路径}
+
+Flow Matching 不从“逐步加噪再去噪”开始，而是先定义一个连续时间概率路径：
+\[
+  p_t(x),\qquad t\in[0,1],
+\]
+使得
+\[
+  p_0(x)=p_{\mathrm{noise}}(x),\qquad
+  p_1(x)=p_{\mathrm{data}}(x).
+\]
+目标是学习一个速度场 \(v_\theta(x,t)\)，使样本沿着 ODE 从噪声分布流向数据分布：
+\[
+  \frac{d x_t}{dt}=v_\theta(x_t,t).
+\]
+
+\subsection{最简单的线性路径}
+
+采样一对端点：
+\[
+  x_0\sim p_{\mathrm{noise}},\qquad x_1\sim p_{\mathrm{data}}.
+\]
+定义线性插值：
+\[
+  x_t=(1-t)x_0+t x_1.
+\]
+则真实速度为：
+\[
+  u_t=x_1-x_0.
+\]
+Flow Matching 训练模型拟合该速度：
+\[
+  \mathcal{L}_{\mathrm{FM}}
+  =
+  \mathbb{E}_{t,x_0,x_1}
+  \left[
+    \left\|
+      v_\theta(x_t,t)-u_t
+    \right\|_2^2
+  \right].
+\]
+带条件时：
+\[
+  \mathcal{L}_{\mathrm{FM}}
+  =
+  \mathbb{E}_{t,x_0,x_1,c}
+  \left[
+    \left\|
+      v_\theta(x_t,t,c)-(x_1-x_0)
+    \right\|_2^2
+  \right].
+\]
+
+\subsection{生成过程}
+
+训练好后，从噪声采样：
+\[
+  x(0)\sim p_{\mathrm{noise}}.
+\]
+然后数值积分：
+\[
+  \frac{dx(t)}{dt}=v_\theta(x(t),t),
+  \qquad t:0\rightarrow 1.
+\]
+最终得到：
+\[
+  x(1)\sim p_\theta(x)\approx p_{\mathrm{data}}(x).
+\]
+
+\subsection{与扩散的关键差别}
+
+扩散模型通常学的是噪声或 score；Flow Matching 学的是速度场。扩散的采样像反复去噪，Flow Matching 的采样像沿着一条连续轨迹移动。
+
+若用 velocity parameterization，扩散与流匹配会变得非常接近。很多现代生成模型并不直接预测 \(\epsilon\)，而是预测速度型变量。区别在于：扩散通常从随机微分方程或加噪过程推导，Flow Matching 直接从概率路径和速度场拟合出发。
+
+\section{Rectified Flow：把路径拉直}
+
+Rectified Flow 可以看作 Flow Matching 的一种重要形式。它希望学习尽可能直的运输路径：
+\[
+  x_t=(1-t)x_0+t x_1.
+\]
+训练目标仍是：
+\[
+  \mathcal{L}_{\mathrm{RF}}
+  =
+  \mathbb{E}_{t,x_0,x_1}
+  \left[
+    \left\|
+      v_\theta(x_t,t)-(x_1-x_0)
+    \right\|_2^2
+  \right].
+\]
+如果速度场足够好，采样时可以用更少的 ODE steps，甚至在理想情况下接近一步生成：
+\[
+  x_1\approx x_0+v_\theta(x_0,0).
+\]
+这解释了为什么流匹配和 rectified flow 常被视为加速生成的路径。
+
+\section{一致性模型：学习跨时间的一致映射}
+
+\subsection{核心对象}
+
+Consistency Models 的目标不是显式学习每一步去噪，也不是显式学习速度场，而是学习一个函数：
+\[
+  f_\theta(x_t,t),
+\]
+使得同一条生成轨道上不同时间点都映射到同一个干净样本：
+\[
+  f_\theta(x_t,t)\approx f_\theta(x_s,s),
+  \qquad s,t\in[0,1].
+\]
+通常还要求边界条件：
+\[
+  f_\theta(x_0,0)=x_0,
+\]
+其中 \(x_0\) 表示干净数据端。
+
+\subsection{一致性训练目标}
+
+设 \(x_t\) 和 \(x_s\) 是同一条噪声轨道上的两个时间点，且 \(s<t\)。一致性损失可以写为：
+\[
+  \mathcal{L}_{\mathrm{CM}}
+  =
+  \mathbb{E}
+  \left[
+    d\left(
+      f_\theta(x_t,t),
+      f_{\theta^-}(x_s,s)
+    \right)
+  \right],
+\]
+其中 \(d(\cdot,\cdot)\) 是距离函数，例如 \(\ell_2\) 或感知距离；\(\theta^-\) 常表示停止梯度或 EMA teacher。
+
+直觉是：无论从较噪的 \(x_t\) 还是较干净的 \(x_s\) 出发，模型都应该给出同一个最终样本估计。
+
+\subsection{从扩散蒸馏}
+
+一致性模型常可由预训练扩散模型蒸馏而来。扩散模型给出一条多步去噪轨道：
+\[
+  x_T\rightarrow x_{T-1}\rightarrow\cdots\rightarrow x_0.
+\]
+一致性模型学习在任意 \(t\) 上直接预测轨道终点：
+\[
+  f_\theta(x_t,t)\approx x_0.
+\]
+因此它的采样可以非常快：
+\[
+  x_T\sim\mathcal{N}(0,I),
+  \qquad
+  \hat{x}_0=f_\theta(x_T,T).
+\]
+也可以做少步采样，在速度和质量之间折中。
+
+\section{四者的底层对比}
+
+\subsection{训练目标对比}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+范式 & 学习对象 & 典型损失 \\
+\midrule
+自回归 & 条件 token 分布 & \(-\sum_t\log p_\theta(x_t\mid x_{<t})\) \\
+扩散 & 噪声 / score / clean data & \(\|\epsilon-\epsilon_\theta(x_t,t)\|^2\) \\
+流匹配 & 速度场 & \(\|v_\theta(x_t,t)-u_t\|^2\) \\
+一致性 & 轨道终点映射 & \(d(f_\theta(x_t,t),f_{\theta^-}(x_s,s))\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{采样过程对比}
+
+\begin{itemize}
+  \item 自回归：按 token 顺序采样，依赖已经生成的前缀。
+  \item 扩散：从高斯噪声开始，多步反向去噪。
+  \item 流匹配：从高斯噪声开始，沿速度场积分。
+  \item 一致性：从噪声状态直接或少步映射到干净样本。
+\end{itemize}
+
+\subsection{误差形态对比}
+
+自回归的误差沿 token 序列累积；扩散的误差沿去噪时间累积；流匹配的误差来自速度场积分误差；一致性模型的误差来自跨时间映射不一致和一步近似过强。
+
+\section{与 WAM / 机器人动作生成的关系}
+
+在 WAM 中，生成对象可能是：
+\[
+  x=[\text{future video latent},\text{action chunk},\text{state/value token}].
+\]
+四种范式对应不同建模方式：
+
+\begin{itemize}
+  \item 自回归：把 \(x\) 离散化为 token，按顺序生成未来和动作。
+  \item 扩散：把整段 \(x\) 当作连续向量，从噪声逐步去噪为 action/video latent。
+  \item 流匹配：学习从噪声到 \(x\) 的速度场，生成时积分得到整段未来和动作。
+  \item 一致性：学习从任意噪声时间点直接映射到最终 \(x\)，用于一步或少步 policy generation。
+\end{itemize}
+
+因此，在读 WAM 论文时，可以追问四个问题：
+\begin{enumerate}
+  \item 生成对象是离散 token 还是连续 latent？
+  \item 模型训练时学的是 next-token、noise、velocity，还是 consistency map？
+  \item 推理时是串行生成、多步去噪、ODE 积分，还是一步映射？
+  \item 该方法的瓶颈来自序列长度、采样步数、ODE solver，还是一致性训练稳定性？
+\end{enumerate}
+
+\section{一句话总结}
+
+自回归把联合分布拆成一串条件分布；扩散把数据逐步扰动成噪声再学习反向去噪；流匹配直接学习从噪声分布到数据分布的连续速度场；一致性模型学习在同一生成轨道上从任意时间点直接回到同一个干净样本。它们都在学习生成分布，但底层对象分别是：条件概率、噪声/score、速度场和一致性映射。
+
+\end{document}
