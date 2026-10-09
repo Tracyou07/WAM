@@ -57,7 +57,7 @@ checked on the target training machine. Changing GPU architecture, Python
 patch, driver, or kernels is not evidence of identical floating-point results.
 
 ```bash
-git clone https://github.com/Tracyou07/WAM.git
+git clone --depth 1 https://github.com/Tracyou07/WAM.git
 cd WAM
 bash scripts/setup_env.sh --device cu128 --python "$PYTHON_BIN"
 source .venv/bin/activate

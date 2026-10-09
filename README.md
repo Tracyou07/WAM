@@ -29,7 +29,7 @@ docs/                 method, provenance and validation boundaries
 Use Linux x86_64 with glibc 2.28 or newer and CPython 3.12.x (including WSL for CPU checks). The fixed installation profile uses PyTorch 2.11.0 and pins training/preparation dependencies. Start from a source checkout:
 
 ```bash
-git clone https://github.com/Tracyou07/WAM.git
+git clone --depth 1 https://github.com/Tracyou07/WAM.git
 cd WAM
 # CUDA 12.8 build for reader-operated GPU training:
 bash scripts/setup_env.sh --device cu128 --python python3.12
