@@ -30,7 +30,7 @@ Linux x86_64 / CPython 3.12.x is the supported reproduction environment. Native 
 Python must include `venv`/`ensurepip` (on Ubuntu with system Python 3.12, install `python3.12-venv` first). An existing Python 3.12 virtual environment can also be supplied with `--venv`.
 
 ```bash
-git clone --depth 1 --branch feat/vrfm-cagrad https://github.com/Tracyou07/WAM.git
+git clone --depth 1 https://github.com/Tracyou07/WAM.git
 cd WAM
 bash scripts/setup_env.sh --device cu128 --python python3.12
 source .venv/bin/activate
