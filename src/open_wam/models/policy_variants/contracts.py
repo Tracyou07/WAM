@@ -1,0 +1,958 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from enum import Enum
+from typing import Any, TypeVar
+
+import torch
+
+from open_wam.configs.enums import (
+    DynamicsObjective,
+    FeatureCacheScope,
+    PolicyOutputModality,
+    ProprioContextMode,
+    TextConditioningMode,
+)
+from open_wam.configs.policy_contracts import PolicyConditioningRequirements
+from open_wam.contracts import (
+    VideoLatentSpaceIdentity,
+    require_compatible_video_latent_spaces,
+)
+from open_wam.models.common import RolloutCursor
+from open_wam.models.common.dynamics_contracts import DynamicsRolloutRequest
+from open_wam.models.visual_tower.contracts import VisualComponentTopology
+
+_DecoderArtifactT = TypeVar("_DecoderArtifactT")
+
+
+class PolicyObservationWindowSessionPolicy(str, Enum):
+    """How recurrent state changes when the observed window advances."""
+
+    REUSE = "reuse"
+    REBUILD_FROM_OBSERVATION_WINDOW = "rebuild_from_observation_window"
+
+
+class PolicyVisualStage(str, Enum):
+    """Visual outputs a policy may request from the shared pipeline."""
+
+    FRONTEND = "frontend"
+    CORE = "core"
+
+
+class PolicyRecurrentHistoryPolicy(str, Enum):
+    """How a recurrent policy replaces speculative history after execution.
+
+    Online composition executes actions inferred from a generated video and then
+    receives real observations. A producer must explicitly declare whether its
+    next inference call replaces the speculative video itself, or whether the
+    rollout driver must reconcile the executed observations into policy state.
+    ``UNSUPPORTED`` keeps ordinary inference available without claiming that a
+    policy is safe to use as either stage of recurrent composition.
+    """
+
+    UNSUPPORTED = "unsupported"
+    NEXT_OBSERVATION = "next_observation"
+    EXPLICIT_RECONCILIATION = "explicit_reconciliation"
+
+
+class PolicyCompositionRngPolicy(str, Enum):
+    """How a composed consumer obtains its inference random stream.
+
+    ``CALLER_STREAM`` preserves the random stream left by the producer. This is
+    required when two independent policy instances decompose one native ordered
+    program exactly. ``ISOLATED_STEP_SEED`` requires an explicit rollout seed
+    and gives a standalone conditional consumer a distinct step seed without
+    advancing the producer's stream.
+    """
+
+    CALLER_STREAM = "caller_stream"
+    ISOLATED_STEP_SEED = "isolated_step_seed"
+
+
+@dataclass(frozen=True)
+class PolicyInferenceOutputRequest:
+    """Architecture-independent selection of inference products.
+
+    Policies may reject a selection when their coupling semantics require an
+    omitted modality to produce the requested one. A missing request on
+    ``PolicyInferContext`` preserves each policy's normal output contract.
+    """
+
+    modalities: frozenset[PolicyOutputModality]
+
+    def __post_init__(self) -> None:
+        modalities = frozenset(
+            PolicyOutputModality(modality) for modality in self.modalities
+        )
+        if not modalities:
+            raise ValueError(
+                "Policy inference must request at least one output modality."
+            )
+        object.__setattr__(self, "modalities", modalities)
+
+    @classmethod
+    def full(cls) -> PolicyInferenceOutputRequest:
+        return cls(frozenset(PolicyOutputModality))
+
+    @classmethod
+    def video_only(cls) -> PolicyInferenceOutputRequest:
+        return cls(frozenset({PolicyOutputModality.VIDEO}))
+
+    @classmethod
+    def action_only(cls) -> PolicyInferenceOutputRequest:
+        return cls(frozenset({PolicyOutputModality.ACTION}))
+
+    def requests(self, modality: PolicyOutputModality) -> bool:
+        return PolicyOutputModality(modality) in self.modalities
+
+
+@dataclass(frozen=True)
+class PolicyCompositionCapability:
+    """Artifact inputs and policy outputs supported by a composed inference call."""
+
+    input_modalities: frozenset[PolicyOutputModality]
+    output_modalities: frozenset[PolicyOutputModality]
+    rng_policy: PolicyCompositionRngPolicy = (
+        PolicyCompositionRngPolicy.ISOLATED_STEP_SEED
+    )
+    required_training_objective: DynamicsObjective | None = None
+
+    def __post_init__(self) -> None:
+        inputs = frozenset(
+            PolicyOutputModality(modality) for modality in self.input_modalities
+        )
+        outputs = frozenset(
+            PolicyOutputModality(modality) for modality in self.output_modalities
+        )
+        if not inputs or not outputs:
+            raise ValueError(
+                "Policy composition capabilities require non-empty inputs and outputs."
+            )
+        object.__setattr__(self, "input_modalities", inputs)
+        object.__setattr__(self, "output_modalities", outputs)
+        if self.required_training_objective is not None:
+            object.__setattr__(
+                self,
+                "required_training_objective",
+                DynamicsObjective(self.required_training_objective),
+            )
+        object.__setattr__(
+            self,
+            "rng_policy",
+            PolicyCompositionRngPolicy(self.rng_policy),
+        )
+
+    @classmethod
+    def video_to_action(
+        cls,
+        *,
+        rng_policy: PolicyCompositionRngPolicy = (
+            PolicyCompositionRngPolicy.ISOLATED_STEP_SEED
+        ),
+        required_training_objective: DynamicsObjective | None = None,
+    ) -> PolicyCompositionCapability:
+        return cls(
+            input_modalities=frozenset({PolicyOutputModality.VIDEO}),
+            output_modalities=frozenset({PolicyOutputModality.ACTION}),
+            rng_policy=rng_policy,
+            required_training_objective=required_training_objective,
+        )
+
+    def matches(self, required: PolicyCompositionCapability) -> bool:
+        """Match transferable inputs and outputs independently of execution policy."""
+
+        return (
+            self.input_modalities == required.input_modalities
+            and self.output_modalities == required.output_modalities
+        )
+
+
+@dataclass(frozen=True)
+class PolicyInferenceCapabilities:
+    """Outputs a policy produces natively and can select independently.
+
+    ``native_modalities`` describes a normal inference call with no selective
+    request. ``selective_requests`` lists exact subsets that the policy can
+    produce without running the omitted output stages. ``composition_capabilities``
+    declares transferable artifact inputs a separate policy instance can consume.
+    A composition may still consume a subset of the native output when no
+    selective producer route exists.
+    """
+
+    native_modalities: frozenset[PolicyOutputModality]
+    selective_requests: tuple[PolicyInferenceOutputRequest, ...] = ()
+    recurrent_history_policy: PolicyRecurrentHistoryPolicy = (
+        PolicyRecurrentHistoryPolicy.UNSUPPORTED
+    )
+    composition_capabilities: tuple[PolicyCompositionCapability, ...] = ()
+    # Describes effective feature reuse; it never grants reconciliation support.
+    feature_cache_scope: FeatureCacheScope = FeatureCacheScope.NONE
+    # Future modalities required by a native call, not observed history.
+    required_future_modalities: frozenset[PolicyOutputModality] = frozenset()
+    required_training_objective: DynamicsObjective | None = None
+
+    def require_future_inputs(
+        self, available: frozenset[PolicyOutputModality]
+    ) -> None:
+        missing = self.required_future_modalities - available
+        if missing:
+            raise ValueError(
+                "Inference requires clean future modalities that this route does "
+                f"not supply: {sorted(item.value for item in missing)}."
+            )
+
+    def __post_init__(self) -> None:
+        native = frozenset(
+            PolicyOutputModality(modality) for modality in self.native_modalities
+        )
+        if not native:
+            raise ValueError(
+                "A policy must declare at least one native output modality."
+            )
+        selective = tuple(self.selective_requests)
+        seen_selective: set[frozenset[PolicyOutputModality]] = set()
+        for request in selective:
+            if not request.modalities.issubset(native):
+                raise ValueError(
+                    "Selective policy outputs must be a subset of native outputs; "
+                    f"native={sorted(item.value for item in native)}, "
+                    f"requested={sorted(item.value for item in request.modalities)}."
+                )
+            if request.modalities == native:
+                raise ValueError(
+                    "Selective policy outputs must be a strict subset of native "
+                    "outputs; omit a request when normal inference already emits "
+                    f"{sorted(item.value for item in native)}."
+                )
+            if request.modalities in seen_selective:
+                raise ValueError(
+                    "Selective policy output requests must be unique; duplicate="
+                    f"{sorted(item.value for item in request.modalities)}."
+                )
+            seen_selective.add(request.modalities)
+        object.__setattr__(self, "native_modalities", native)
+        object.__setattr__(
+            self,
+            "required_future_modalities",
+            frozenset(
+                PolicyOutputModality(item) for item in self.required_future_modalities
+            ),
+        )
+        if self.required_training_objective is not None:
+            object.__setattr__(
+                self,
+                "required_training_objective",
+                DynamicsObjective(self.required_training_objective),
+            )
+        object.__setattr__(
+            self, "feature_cache_scope", FeatureCacheScope(self.feature_cache_scope)
+        )
+        object.__setattr__(self, "selective_requests", selective)
+        compositions = tuple(self.composition_capabilities)
+        for index, capability in enumerate(compositions):
+            if any(capability.matches(other) for other in compositions[index + 1 :]):
+                raise ValueError(
+                    "Policy composition input/output capabilities must be unique."
+                )
+        for capability in compositions:
+            if not capability.output_modalities.issubset(native):
+                raise ValueError(
+                    "Policy composition outputs must be a subset of native outputs; "
+                    f"native={sorted(item.value for item in native)}, "
+                    "composition_outputs="
+                    f"{sorted(item.value for item in capability.output_modalities)}."
+                )
+        object.__setattr__(
+            self,
+            "composition_capabilities",
+            compositions,
+        )
+        history_policy = PolicyRecurrentHistoryPolicy(self.recurrent_history_policy)
+        object.__setattr__(
+            self,
+            "recurrent_history_policy",
+            history_policy,
+        )
+
+    def request_for(
+        self,
+        required_modalities: frozenset[PolicyOutputModality],
+    ) -> PolicyInferenceOutputRequest | None:
+        """Resolve an efficient request while permitting native supersets.
+
+        ``None`` means the normal policy output already contains every required
+        modality. This is important for coupled policies whose video is valid
+        but cannot be generated independently from their action stream.
+        """
+
+        required = frozenset(
+            PolicyOutputModality(modality) for modality in required_modalities
+        )
+        if not required:
+            raise ValueError("A composition must require at least one output modality.")
+        if not required.issubset(self.native_modalities):
+            raise ValueError(
+                "Policy does not produce every required modality; "
+                f"native={sorted(item.value for item in self.native_modalities)}, "
+                f"required={sorted(item.value for item in required)}."
+            )
+        for request in self.selective_requests:
+            if request.modalities == required:
+                return request
+        return None
+
+    def supports_composition(
+        self,
+        capability: PolicyCompositionCapability,
+    ) -> bool:
+        """Return whether the policy accepts one transferable artifact route."""
+
+        return self.composition_for(capability) is not None
+
+    def composition_for(
+        self,
+        capability: PolicyCompositionCapability,
+    ) -> PolicyCompositionCapability | None:
+        """Resolve consumer-owned execution semantics for an artifact route."""
+
+        return next(
+            (
+                declared
+                for declared in self.composition_capabilities
+                if declared.matches(capability)
+            ),
+            None,
+        )
+
+
+@dataclass(frozen=True)
+class PolicyTemporalGeometry:
+    """Architecture-independent temporal geometry for one inference session.
+
+    ``attention_window_size`` is measured in logical temporal block ids.
+    VTA-compatible interleaved and causal-video programs assign two block ids
+    to each model chunk.
+    """
+
+    frame_chunk_size: int
+    attention_window_size: int
+
+    def __post_init__(self) -> None:
+        if int(self.frame_chunk_size) <= 0:
+            raise ValueError(
+                "Policy temporal frame_chunk_size must be positive, "
+                f"got {self.frame_chunk_size}."
+            )
+        if int(self.attention_window_size) <= 0:
+            raise ValueError(
+                "Policy temporal attention_window_size must be positive, "
+                f"got {self.attention_window_size}."
+            )
+
+
+@dataclass(frozen=True)
+class PolicyTemporalSpan:
+    """Half-open model-frame interval owned by one inference transaction."""
+
+    start_frame: int
+    frame_count: int
+
+    def __post_init__(self) -> None:
+        if int(self.start_frame) < 0:
+            raise ValueError(
+                "Policy temporal spans require a non-negative start frame, "
+                f"got {self.start_frame}."
+            )
+        if int(self.frame_count) <= 0:
+            raise ValueError(
+                "Policy temporal spans require a positive frame count, "
+                f"got {self.frame_count}."
+            )
+
+    @property
+    def end_frame(self) -> int:
+        return int(self.start_frame) + int(self.frame_count)
+
+    def prefix(self, frame_count: int) -> PolicyTemporalSpan:
+        """Return an executed prefix while preserving this span's origin."""
+
+        resolved_count = int(frame_count)
+        if resolved_count <= 0 or resolved_count > int(self.frame_count):
+            raise ValueError(
+                "Executed temporal prefixes must contain between one and the "
+                "full speculative frame count; "
+                f"executed={resolved_count}, speculative={self.frame_count}."
+            )
+        return PolicyTemporalSpan(
+            start_frame=int(self.start_frame),
+            frame_count=resolved_count,
+        )
+
+
+@dataclass(frozen=True)
+class PolicyExecutionCommit:
+    """Observed execution replacing a speculative model span.
+
+    Execution can stop early or continue with fallback controls beyond the
+    prediction. The speculative span identifies the candidate being replaced;
+    the observed span describes what actually happened.
+    """
+
+    speculative_span: PolicyTemporalSpan
+    executed_frame_count: int
+
+    def __post_init__(self) -> None:
+        if int(self.executed_frame_count) <= 0:
+            raise ValueError(
+                "An execution commit requires a positive observed frame count."
+            )
+
+    @property
+    def executed_span(self) -> PolicyTemporalSpan:
+        return PolicyTemporalSpan(
+            self.speculative_span.start_frame,
+            int(self.executed_frame_count),
+        )
+
+
+@dataclass(frozen=True)
+class PolicyGeneratedVideo:
+    """Future-only latent video emitted for downstream composition.
+
+    Conditioning or observed-prefix frames are deliberately excluded. This
+    makes a causal video-only model, a selective VTA producer, and a jointly decoded
+    policy expose the same downstream handoff semantics.
+    """
+
+    latents: torch.Tensor
+    frame_start: int | None = None
+    latent_space_identity: VideoLatentSpaceIdentity | None = None
+
+    def __post_init__(self) -> None:
+        if self.latents.ndim != 5 or int(self.latents.shape[2]) <= 0:
+            raise ValueError(
+                "Generated video must be a non-empty [B, C, T, H, W] tensor, "
+                f"got {tuple(self.latents.shape)}."
+            )
+        if self.frame_start is not None and int(self.frame_start) < 0:
+            raise ValueError(
+                f"Generated-video frame_start must be non-negative, got {self.frame_start}."
+            )
+
+
+@dataclass(frozen=True)
+class PolicyVideoGenerationRequest:
+    """Number of future frames requested from a video producer."""
+
+    frame_count: int
+
+    def __post_init__(self) -> None:
+        if int(self.frame_count) <= 0:
+            raise ValueError(
+                f"Video generation frame_count must be positive, got {self.frame_count}."
+            )
+
+
+@dataclass(frozen=True)
+class PolicyVideoConditionedActionRequest:
+    """Transfer a future video artifact into an independent action policy call.
+
+    Observed history, text, proprioception, and executed-action history remain on
+    the ordinary inference context and recurrent session. The consumer decides
+    which of those available signals are visible under its own policy semantics.
+    """
+
+    generated_video: PolicyGeneratedVideo
+
+    def __post_init__(self) -> None:
+        if self.generated_video.frame_start is None:
+            raise ValueError(
+                "Generated video is missing its temporal origin, so action-consumer "
+                "alignment cannot be verified."
+            )
+
+    @property
+    def capability(self) -> PolicyCompositionCapability:
+        return PolicyCompositionCapability.video_to_action()
+
+    def validate_consumer_latent_space(
+        self,
+        consumer: VideoLatentSpaceIdentity | None,
+    ) -> None:
+        """Reject identified producer and consumer spaces that cannot compose."""
+
+        producer = self.generated_video.latent_space_identity
+        if producer is None and consumer is None:
+            return
+        require_compatible_video_latent_spaces(producer, consumer)
+
+    def validate_output_frame_start(self, frame_start: int | None) -> None:
+        """Require the consumer output to preserve the transferred time origin."""
+
+        producer_start = self.generated_video.frame_start
+        assert producer_start is not None
+        if frame_start is None:
+            raise RuntimeError(
+                "The video-conditioned action consumer did not report its generated "
+                "frame origin, so temporal handoff parity cannot be verified."
+            )
+        if int(producer_start) != int(frame_start):
+            raise RuntimeError(
+                "Generated-video producer and action consumer use different temporal "
+                "origins: "
+                f"producer_frame_start={int(producer_start)}, "
+                f"consumer_frame_start={int(frame_start)}."
+            )
+
+
+@dataclass(frozen=True)
+class PolicyRolloutContract:
+    """Variant-owned lifecycle semantics consumed by generic rollout code."""
+
+    observation_window_session_policy: PolicyObservationWindowSessionPolicy = (
+        PolicyObservationWindowSessionPolicy.REUSE
+    )
+    action_tokens_per_frame: int = 1
+    startup_observation_frames: int = 1
+    supports_speculative_continuation: bool = False
+
+    def __post_init__(self) -> None:
+        if self.action_tokens_per_frame <= 0 or self.startup_observation_frames <= 0:
+            raise ValueError(
+                "Rollout action density and startup context must be positive."
+            )
+
+
+@dataclass(frozen=True)
+class PolicyStateDictOverlay:
+    """Additional module state projected into a shared exported state dict."""
+
+    module: torch.nn.Module
+    map_key: Callable[[str], str | None]
+    exclusive_target_prefixes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PolicyModuleTopology:
+    """Variant-owned module placement consumed by generic training services.
+
+    A policy may transfer shared-backbone or action-side blocks into a packed
+    owner without exposing that implementation detail to component selection,
+    FSDP, or checkpoint export.
+    """
+
+    visual_runtime_modules: tuple[torch.nn.Module, ...]
+    visual_components: VisualComponentTopology = field(
+        default_factory=VisualComponentTopology
+    )
+    action_expert_modules: tuple[torch.nn.Module, ...] = ()
+    fsdp_block_stacks: tuple[torch.nn.Module, ...] = ()
+    fsdp_atomic_modules: tuple[torch.nn.Module, ...] = ()
+    runtime_backbone_state_overlays: tuple[PolicyStateDictOverlay, ...] = ()
+
+
+@dataclass(frozen=True)
+class PolicyPipelineRequirements:
+    """Policy-declared geometry and shared conditioning requirements.
+
+    The composition factory consumes this contract without knowing which policy
+    architecture produced it. Action geometry is expressed in model space and
+    can differ from dataset geometry when the policy owns an action adapter.
+    """
+
+    action_dim: int
+    action_horizon: int
+    state_dim: int
+    proprio_context_mode: ProprioContextMode = ProprioContextMode.NONE
+    dynamics_mode_context_enabled: bool = False
+    text_conditioning_mode: TextConditioningMode = TextConditioningMode.TASK_PROMPT
+    source_action_channel_ids: tuple[int, ...] = ()
+    accepted_source_action_shapes: tuple[tuple[int, int], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "proprio_context_mode",
+            ProprioContextMode(self.proprio_context_mode),
+        )
+        object.__setattr__(
+            self,
+            "text_conditioning_mode",
+            TextConditioningMode(self.text_conditioning_mode),
+        )
+        if int(self.action_dim) <= 0:
+            raise ValueError(
+                "Pipeline requirements need a positive model action dimension, "
+                f"got {self.action_dim}."
+            )
+        if int(self.action_horizon) < 0:
+            raise ValueError(
+                "Pipeline requirements need a non-negative model action horizon, "
+                f"got {self.action_horizon}."
+            )
+        if int(self.state_dim) < 0:
+            raise ValueError(
+                "Pipeline requirements need a non-negative state dimension, "
+                f"got {self.state_dim}."
+            )
+        if (
+            self.proprio_context_mode != ProprioContextMode.NONE
+            and int(self.state_dim) == 0
+        ):
+            raise ValueError(
+                "Proprio conditioning requires a positive state dimension."
+            )
+        source_action_channel_ids = tuple(
+            int(index) for index in self.source_action_channel_ids
+        )
+        if any(index < 0 for index in source_action_channel_ids):
+            raise ValueError("Source action channel ids must be non-negative.")
+        if len(set(source_action_channel_ids)) != len(source_action_channel_ids):
+            raise ValueError("Source action channel ids must be unique.")
+        if source_action_channel_ids and max(source_action_channel_ids) >= int(
+            self.action_dim
+        ):
+            raise ValueError(
+                "Source action channel ids must index the model action space, "
+                f"got max_index={max(source_action_channel_ids)} and "
+                f"action_dim={self.action_dim}."
+            )
+        object.__setattr__(
+            self,
+            "source_action_channel_ids",
+            source_action_channel_ids,
+        )
+        accepted_source_action_shapes = tuple(
+            (int(action_dim), int(action_horizon))
+            for action_dim, action_horizon in self.accepted_source_action_shapes
+        )
+        if any(
+            action_dim <= 0 or action_horizon < 0
+            for action_dim, action_horizon in accepted_source_action_shapes
+        ):
+            raise ValueError(
+                "Accepted source action shapes require a positive action dimension "
+                "and non-negative horizon."
+            )
+        if len(set(accepted_source_action_shapes)) != len(
+            accepted_source_action_shapes
+        ):
+            raise ValueError("Accepted source action shapes must be unique.")
+        object.__setattr__(
+            self,
+            "accepted_source_action_shapes",
+            accepted_source_action_shapes,
+        )
+
+    def validate_source_action_shape(
+        self,
+        *,
+        action_dim: int,
+        action_horizon: int,
+    ) -> None:
+        """Require dataset actions to match a policy-supported input shape."""
+
+        if not self.accepted_source_action_shapes:
+            return
+        actual = (int(action_dim), int(action_horizon))
+        if actual in self.accepted_source_action_shapes:
+            return
+        supported = ", ".join(
+            f"(action_dim={source_dim}, action_horizon={source_horizon})"
+            for source_dim, source_horizon in self.accepted_source_action_shapes
+        )
+        raise ValueError(
+            "Dataset action geometry is not accepted by the policy input adapter: "
+            f"got action_dim={actual[0]}, action_horizon={actual[1]}; "
+            f"supported shapes: {supported}."
+        )
+
+    def validate_action_decoder(
+        self,
+        *,
+        action_dim: int,
+        action_horizon: int,
+    ) -> None:
+        """Require the decoder to consume the policy's model-space geometry."""
+
+        actual = (int(action_dim), int(action_horizon))
+        expected = (int(self.action_dim), int(self.action_horizon))
+        if actual == expected:
+            return
+        raise ValueError(
+            "Policy and action decoder model-space geometry do not match: "
+            f"policy requires action_dim={expected[0]}, action_horizon={expected[1]}; "
+            f"decoder declares action_dim={actual[0]}, action_horizon={actual[1]}."
+        )
+
+    def validate_visual_tower(
+        self,
+        *,
+        action_dim: int | None,
+        state_dim: int | None,
+    ) -> None:
+        """Require shared tower adapters to use the policy's model geometry."""
+
+        actual = (action_dim, state_dim)
+        expected = (int(self.action_dim), int(self.state_dim))
+        if actual == expected:
+            return
+        raise ValueError(
+            "Policy and visual tower model-space geometry do not match: "
+            f"policy requires action_dim={expected[0]}, state_dim={expected[1]}; "
+            f"tower declares action_dim={actual[0]}, state_dim={actual[1]}."
+        )
+
+    def validate_conditioning(
+        self,
+        configured: PolicyConditioningRequirements,
+    ) -> None:
+        """Require module-time needs to match pre-allocation config needs."""
+
+        expected = PolicyConditioningRequirements(
+            proprio_context_mode=self.proprio_context_mode,
+            dynamics_mode_context_enabled=self.dynamics_mode_context_enabled,
+            text_conditioning_mode=self.text_conditioning_mode,
+        )
+        if configured == expected:
+            return
+        raise ValueError(
+            "Policy runtime conditioning requirements do not match the policy "
+            "configuration used to assemble the visual tower: "
+            f"config={configured!r}, runtime={expected!r}. Declare shared "
+            "conditioning on the policy config before pipeline construction."
+        )
+
+
+@dataclass(frozen=True)
+class DecoderArtifactEnvelope:
+    """Typed handoff from one policy architecture to its action decoder.
+
+    ``contract`` is an open extension identifier, while ``payload`` is owned by
+    the policy/decoder pair that declares it. This keeps architecture-specific
+    tensors out of the shared pipeline and replaces undocumented ``aux`` keys.
+    """
+
+    contract: str
+    payload: Any
+    dynamics_objective: DynamicsObjective | None = None
+
+    def require(
+        self,
+        *,
+        contract: str,
+        payload_type: type[_DecoderArtifactT],
+    ) -> _DecoderArtifactT:
+        if self.contract != contract:
+            raise ValueError(
+                f"Decoder artifact contract {self.contract!r} does not match "
+                f"required contract {contract!r}."
+            )
+        if not isinstance(self.payload, payload_type):
+            raise TypeError(
+                f"Decoder artifact contract {contract!r} requires payload "
+                f"{payload_type.__name__}, got {type(self.payload).__name__}."
+            )
+        return self.payload
+
+
+@dataclass
+class PolicyTrainBatch:
+    """Structured policy training inputs independent from attachment site.
+
+    ``source_text_context`` retains the positive conditioning tensor when the
+    training executor selects an unconditional context for classifier-free
+    dropout. Policies that validate their conditioning source can inspect it
+    without changing the effective context consumed by the visual stack.
+    """
+
+    actions: torch.Tensor
+    action_mask: torch.Tensor | None = None
+
+    state: torch.Tensor | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+    source_text_context: torch.Tensor | None = None
+
+
+@dataclass
+class PolicyPreparedInputs:
+    """Prepared variant-specific inputs."""
+
+    batch: PolicyTrainBatch
+    variant_inputs: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PolicyTrainOutput:
+    """Train-time features emitted by a policy variant."""
+
+    policy_features: torch.Tensor
+    metrics: dict[str, torch.Tensor]
+    decoder_artifacts: DecoderArtifactEnvelope | None = None
+    aux: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PolicyInferState:
+    """Immutable session publication; variants must also treat tensors as read-only."""
+
+    cursor: RolloutCursor = field(default_factory=RolloutCursor)
+    variant_state: Any | None = None
+    decoder_state: Any | None = None
+    temporal_geometry: PolicyTemporalGeometry | None = None
+    revision: int = 0
+    observed_frame_end: int = 0
+
+    @property
+    def step_index(self) -> int:
+        return self.cursor.block_index
+
+    @property
+    def speculative_span(self) -> PolicyTemporalSpan | None:
+        count = self.cursor.current_start_frame - self.observed_frame_end
+        return PolicyTemporalSpan(self.observed_frame_end, count) if count > 0 else None
+
+    def with_temporal_geometry(
+        self,
+        temporal_geometry: PolicyTemporalGeometry,
+        *,
+        label: str = "inference state",
+    ) -> PolicyInferState:
+        """Validate and return a geometry-bound candidate, never mutate a session."""
+
+        if (
+            self.temporal_geometry is not None
+            and self.temporal_geometry != temporal_geometry
+        ):
+            raise ValueError(
+                "Policy temporal geometry cannot change within an inference "
+                f"session: {label} has {self.temporal_geometry}, requested "
+                f"{temporal_geometry}."
+            )
+        return replace(self, temporal_geometry=temporal_geometry)
+
+
+@dataclass(frozen=True)
+class PolicyObservedHistory:
+    """Canonical observations committed after executing a speculative interval.
+
+    ``video_latents`` and ``proprio_history`` describe only the newly observed
+    window, not the policy's full recurrent cache. ``action_history`` contains
+    the model-space actions actually executed for this commit; a policy decides
+    how much speculative action history they replace. ``observation_frame_count`` is
+    the raw environment-frame count and can differ from latent time.
+    ``execution_commit`` identifies the speculative model span being reconciled.
+    ``action_mask`` is optional binary validity [B, T_action, 1], allowing an
+    observed startup frame with no preceding action to remain aligned.
+    """
+
+    video_latents: torch.Tensor
+    observation_frame_count: int
+    action_history: torch.Tensor | None = None
+    proprio_history: torch.Tensor | None = None
+    execution_commit: PolicyExecutionCommit | None = None
+    action_mask: torch.Tensor | None = None
+
+    # Only used to seed a new session; later commits identify their own span.
+    start_frame: int = 0
+
+
+@dataclass(frozen=True)
+class PolicyObservedHistoryOutput:
+    """Policy state and diagnostics after reconciling real observations."""
+
+    next_state: PolicyInferState | None
+    debug: dict[str, Any] = field(default_factory=dict)
+    applied: bool = False
+
+
+@dataclass(frozen=True)
+class PolicyInferContext:
+    """Inputs required for one policy inference step."""
+
+    state: torch.Tensor | None = None
+    previous_action: torch.Tensor | None = None
+    dynamics: DynamicsRolloutRequest | None = None
+    task_text: tuple[str | None, ...] | None = None
+    metadata: tuple[dict[str, Any], ...] | None = None
+    sample_seed: int | None = None
+    initial_video_noise: torch.Tensor | None = None
+    initial_action_noise: torch.Tensor | None = None
+    initial_route_uniform: torch.Tensor | None = None
+    output_request: PolicyInferenceOutputRequest | None = None
+    video_generation: PolicyVideoGenerationRequest | None = None
+    video_conditioned_action: PolicyVideoConditionedActionRequest | None = None
+    temporal_geometry: PolicyTemporalGeometry | None = None
+
+    def require_temporal_geometry(self) -> PolicyTemporalGeometry:
+        if self.temporal_geometry is None:
+            raise RuntimeError(
+                "Policy inference context has not resolved temporal geometry."
+            )
+        return self.temporal_geometry
+
+
+@dataclass(frozen=True)
+class PolicyRolloutTelemetry:
+    """Architecture-neutral facts derived from a published inference state."""
+
+    state_revision: int
+    chunk_index: int
+    observed_frame_end: int
+    generated_span: PolicyTemporalSpan | None
+    speculative_span: PolicyTemporalSpan | None
+
+
+@dataclass
+class PolicyInferOutput:
+    """Inference-time features emitted by a policy variant."""
+
+    policy_features: torch.Tensor
+    next_state: PolicyInferState
+    decoder_artifacts: DecoderArtifactEnvelope | None = None
+    aux: dict[str, Any] = field(default_factory=dict)
+    generated_video: PolicyGeneratedVideo | None = None
+    generation_frame_start: int | None = None
+
+    @property
+    def telemetry(self) -> PolicyRolloutTelemetry:
+        return PolicyRolloutTelemetry(
+            state_revision=self.next_state.revision,
+            chunk_index=self.next_state.step_index,
+            observed_frame_end=self.next_state.observed_frame_end,
+            generated_span=self.generated_span,
+            speculative_span=self.next_state.speculative_span,
+        )
+
+    @property
+    def generated_span(self) -> PolicyTemporalSpan | None:
+        """The published cursor is the exclusive end of this prediction."""
+        if self.generation_frame_start is None:
+            return None
+        return PolicyTemporalSpan(
+            self.generation_frame_start,
+            self.next_state.cursor.current_start_frame - self.generation_frame_start,
+        )
+
+    def __post_init__(self) -> None:
+        if (
+            self.generation_frame_start is not None
+            and int(self.generation_frame_start) < 0
+        ):
+            raise ValueError(
+                "Policy inference generation_frame_start must be non-negative, "
+                f"got {self.generation_frame_start}."
+            )
+        video_start = (
+            None if self.generated_video is None else self.generated_video.frame_start
+        )
+        if (
+            video_start is not None
+            and self.generation_frame_start is not None
+            and int(video_start) != int(self.generation_frame_start)
+        ):
+            raise ValueError(
+                "Policy inference and generated-video temporal origins differ: "
+                f"output={self.generation_frame_start}, video={video_start}."
+            )

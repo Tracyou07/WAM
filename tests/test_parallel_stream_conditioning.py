@@ -1,0 +1,189 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import torch
+
+from open_wam.configs import (
+    ContextConditionLatentSource,
+    DynamicsObjective,
+    ProprioContextMode,
+    VideoActionProgram,
+)
+from open_wam.configs.policy_parallel_stream import ParallelStreamPolicyConfig
+from open_wam.contracts import ConditionalDynamicsSequenceLayout
+from open_wam.models.common.dynamics_objectives import (
+    DynamicsSamplePlan,
+)
+from open_wam.models.common.proprio_conditioning import (
+    HiddenProprioContext,
+    ProprioContextGranularity,
+)
+from open_wam.models.policy_variants.contracts import PolicyTrainBatch
+from open_wam.models.policy_variants.parallel_stream.conditioning import (
+    ParallelStreamConditioning,
+)
+
+
+def _conditioning() -> ParallelStreamConditioning:
+    return ParallelStreamConditioning(
+        ParallelStreamPolicyConfig(
+            program=VideoActionProgram.VIDEO_THEN_ACTION,
+            proprio_context_mode=ProprioContextMode.PER_CHUNK_ADDITIVE,
+        )
+    )
+
+
+def test_train_hidden_proprio_context_prefers_frame_state_and_applies_mask() -> None:
+    frame_state = torch.tensor([[[1.0], [2.0]]], requires_grad=True)
+    frame_mask = torch.tensor([[[1.0], [0.0]]])
+    chunk_state = torch.tensor([[[3.0]]], requires_grad=True)
+    batch = PolicyTrainBatch(
+        actions=torch.zeros(1, 1, 1),
+        extra={
+            "proprio_context_frames": frame_state,
+            "proprio_context_frames_mask": frame_mask,
+            "proprio_context_state": chunk_state,
+        },
+    )
+
+    standard_payload = _conditioning().resolve_train_hidden_proprio_context(
+        batch,
+        label="test",
+    )
+    assert standard_payload is not None
+    torch.testing.assert_close(
+        standard_payload.values,
+        torch.tensor([[[1.0], [0.0]]]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert standard_payload.granularity.value == "frame"
+
+    standard_payload.values.sum().backward()
+    torch.testing.assert_close(frame_state.grad, frame_mask, rtol=0.0, atol=0.0)
+
+
+def test_rollout_state_selection_uses_the_most_recent_measurement() -> None:
+    state = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2)
+    standard = _conditioning()
+
+    torch.testing.assert_close(
+        standard.select_rollout_proprio_state(state),
+        state[:, -1, :],
+        rtol=0.0,
+        atol=0.0,
+    )
+
+def test_prefix_hidden_proprio_alignment_keeps_condition_frame_separate() -> None:
+    conditioning = _conditioning()
+    artifacts = SimpleNamespace(input_dict={"prefix_condition_frames": 1})
+    batch = PolicyTrainBatch(
+        actions=torch.zeros(1, 1, 1),
+        state=torch.tensor([[[2.0], [4.0]]]),
+    )
+    target_state = torch.tensor([[[10.0], [20.0], [30.0]]])
+    video_latents = torch.zeros(1, 1, 3, 1, 1, dtype=torch.float64)
+
+    conditioning.attach_train_hidden_proprio_context(
+        artifacts,
+        batch=batch,
+        video_latents=video_latents,
+        payload=HiddenProprioContext(
+            values=target_state,
+            granularity=ProprioContextGranularity.FRAME,
+        ),
+    )
+
+    torch.testing.assert_close(
+        artifacts.input_dict["per_chunk_proprio_state"],
+        torch.tensor([[[4.0], [10.0], [20.0], [30.0]]], dtype=torch.float64),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert artifacts.input_dict["per_chunk_proprio_state_granularity"] == "frame"
+
+
+def test_train_condition_latents_preserve_values_dtype_and_storage() -> None:
+    conditioning = ParallelStreamConditioning(
+        ParallelStreamPolicyConfig(
+            program=VideoActionProgram.VIDEO_THEN_ACTION,
+            use_condition_latents=True,
+        )
+    )
+    video_latents = torch.zeros(1, 2, 3, 4, 5, dtype=torch.float64)
+    condition_latents = torch.arange(
+        video_latents.numel(),
+        dtype=torch.float64,
+    ).reshape_as(video_latents)
+    batch = PolicyTrainBatch(
+        actions=torch.zeros(1, 1, 1),
+        extra={"condition_latents": condition_latents},
+    )
+
+    resolved = conditioning.resolve_train_condition_latents(
+        batch,
+        video_latents=video_latents,
+    )
+
+    assert resolved is condition_latents
+    torch.testing.assert_close(resolved, condition_latents, rtol=0.0, atol=0.0)
+
+
+def test_external_condition_prefix_is_selected_by_resolved_sample_layout() -> None:
+    aligned = ParallelStreamConditioning(
+        ParallelStreamPolicyConfig(program=VideoActionProgram.VIDEO_THEN_ACTION)
+    )
+    external = ParallelStreamConditioning(
+        ParallelStreamPolicyConfig(
+            program=VideoActionProgram.VIDEO_THEN_ACTION,
+            context_condition_latent_source=(
+                ContextConditionLatentSource.SINGLE_FRAME_CONDITION_LATENT
+            ),
+            use_condition_latents=True,
+            require_condition_latents=True,
+        )
+    )
+
+    assert (
+        aligned.uses_external_condition_prefix(context_prefix_frames_in_sample=0)
+        is False
+    )
+    assert (
+        external.uses_external_condition_prefix(context_prefix_frames_in_sample=None)
+        is True
+    )
+    assert (
+        external.uses_external_condition_prefix(context_prefix_frames_in_sample=0)
+        is True
+    )
+    assert (
+        external.uses_external_condition_prefix(context_prefix_frames_in_sample=1)
+        is False
+    )
+
+    target_only_plan = DynamicsSamplePlan(
+        program=VideoActionProgram.GENERALIST_JOINT_DENOISING,
+        objective=DynamicsObjective.ACTION_CONDITIONED_VIDEO,
+        routed_objective=DynamicsObjective.ACTION_CONDITIONED_VIDEO,
+        drop_text_conditioning=True,
+        source="real_demo",
+        sequence=ConditionalDynamicsSequenceLayout(),
+    )
+    dynamics = ParallelStreamConditioning(
+        ParallelStreamPolicyConfig(
+            program=VideoActionProgram.GENERALIST_JOINT_DENOISING,
+            context_condition_latent_source=(
+                ContextConditionLatentSource.SINGLE_FRAME_CONDITION_LATENT
+            ),
+            use_condition_latents=True,
+            require_condition_latents=True,
+        )
+    )
+    assert (
+        dynamics.uses_external_condition_prefix(
+            context_prefix_frames_in_sample=None,
+            dynamics_sample_plan=target_only_plan,
+        )
+        is False
+    )

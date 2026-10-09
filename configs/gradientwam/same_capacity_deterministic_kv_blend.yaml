@@ -1,0 +1,17 @@
+experiment: native_experiment.yaml
+arm: same_capacity_deterministic_kv_blend
+checkpoint:
+  path: ${GW_CHECKPOINT}
+  sha256: ${GW_CHECKPOINT_SHA256}
+assets:
+  dataset_root: ${GW_DATASET_ROOT}
+  frontend_root: ${GW_FRONTEND_ROOT}
+  tokenizer_root: ${GW_TOKENIZER_ROOT}
+  preparation_root: ${GW_PREPARATION_ROOT}
+  prompt_encoder_fingerprint: ${GW_PROMPT_FINGERPRINT:-}
+run:
+  seed: 20261008
+  route_seed: 20261008
+  episode_id: 378
+  max_minutes: 60
+  output_root: ${GW_OUTPUT_ROOT}

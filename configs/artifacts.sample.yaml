@@ -1,0 +1,39 @@
+artifacts:
+  - artifact_id: parallel-stream-libero-video-then-action
+    architecture: parallel_stream
+    variant: video_then_action
+    benchmark: libero_10
+    config: configs/experiments/parallel_stream_libero_video_then_action.yaml
+    local_path_alias: checkpoints.parallel_stream_exact_libero_step_1100_0402
+    expected_layout:
+      root_files:
+        - full_training_state.pt
+      directories:
+        - transformer
+      transformer_files:
+        - transformer/config.json
+    download_url: null
+    checksum: null
+    license: null
+    source: "private_or_pending_public_export"
+    notes: "Replace with the public checkpoint URL and checksum."
+
+  - artifact_id: public-tiny-synthetic-contract
+    architecture: fixture
+    variant: public_tiny_synthetic_contract
+    benchmark: synthetic
+    config: configs/examples/public_tiny_synthetic_contract.yaml
+    local_path_alias: null
+    expected_layout:
+      root_files:
+        - model_state.pt
+        - full_training_state.pt
+      directories:
+        - transformer
+      transformer_files:
+        - transformer/config.json
+    download_url: null
+    checksum: null
+    license: MIT
+    source: "tests/fixtures/public_tiny/artifacts/checkpoint_step_1"
+    notes: "Structural placeholder artifact for public CI and docs; not a real model checkpoint."

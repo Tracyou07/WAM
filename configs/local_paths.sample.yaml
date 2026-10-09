@@ -1,0 +1,92 @@
+paths:
+  datasets:
+    # Maintained latent-local LIBERO root. Copy this file to
+    # configs/local_paths.yaml and populate the keys referenced by the config
+    # you intend to run. Unused placeholders may remain unchanged.
+    libero_root: /path/to/datasets/libero_10
+    # Replay-status labels that split successful training episodes from failure/
+    # error validation episodes. Required by the LIBERO configs that select
+    # replay-filtered splits (`require_replay_status: true`); those runs fail
+    # without it. The generalist joint-denoising configs set
+    # `require_replay_status: false` and do not need it.
+    #
+    # This file is NOT shipped inside a latent-local LIBERO dataset root. It is
+    # produced by a separate simulator replay-labeling pass, whose per-subset
+    # output shards land under a diagnostic root. `build_libero_replay_metadata.py`
+    # merges those shards and can install the result into the dataset:
+    #
+    #   uv run python scripts/build_libero_replay_metadata.py \
+    #     --subset-root libero_10=/path/to/datasets/libero_10 \
+    #     --diagnostic-root /path/to/libero_failure_labels \
+    #     --subsets libero_10 \
+    #     --source-run libero_10=<replay_run_id> \
+    #     --install-dataset-meta
+    #
+    # `--subset-root` is an explicit <subset>=<path> mapping and may be repeated.
+    # The compatibility `--dataset-root /path/to/datasets` form still appends
+    # `/<subset>` itself. At least one `--source-run <subset>=<run_id>` is required,
+    # naming a labeling run under `--diagnostic-root`; that labeling pass is not
+    # produced by this script. To re-validate a file that is already installed,
+    # use `--from-installed-meta` instead of `--source-run`.
+    #
+    # `--install-dataset-meta` writes to <subset-root>/meta/ (or to
+    # <dataset-root>/<subset>/meta/ through the compatibility form), which is the
+    # default assumed below. Point this at the file's real location if you were
+    # handed one out of band instead.
+    libero_replay_status_path: ${paths.datasets.libero_root}/meta/replay_status.jsonl
+    # Public/local LIBERO checkout used by local HDF5 configs.
+    libero_public_root: /path/to/datasets/libero/libero_10
+    # Shared negative-prompt embedding used by latent-local datasets.
+    empty_text_embedding: /path/to/artifacts/text/empty_emb.pt
+    # Encoded target-only counterfactual dynamics latents. These are required
+    # by GJD or conditional FDM/IDM whenever a counterfactual route weight is
+    # positive, including the conditional config's default 1:1 source ratio.
+    # A real-demo-only run may omit its matching counterfactual route instead.
+    libero_gjd_counterfactual_train_latent_root: /path/to/datasets/fdm_counterfactual_demo/libero10_fdm_counterfactual_coverage_10000_h32_ctx16_random_t0_seed0_sharded/encoded_latents
+    libero_gjd_counterfactual_val_latent_root: /path/to/datasets/fdm_counterfactual_demo/libero10_fdm_counterfactual_validation_1000_h32_ctx16_random_t0_seed1/encoded_latents
+    # Local RoboTwin LeRobot-v2 member or downloaded nested member root.
+    robotwin_lerobot_video_root: /path/to/datasets/robotwin/lerobot_member
+    # Local CALVIN debug or full split root containing episode_*.npz files.
+    calvin_root: /path/to/datasets/calvin/task_D_D
+    # Manifest-first RGB video source bundle for mixed video-only pretraining.
+    # The manifest follows the nmotions mixed-video CSV columns and points at
+    # local video_path entries relative to mixed_video_root or HF shard paths.
+    mixed_video_root: /path/to/datasets/mixed_video
+    mixed_video_manifest: ${paths.datasets.mixed_video_root}/mixed_video_manifest.csv
+    mixed_video_libero_manifest: ${paths.datasets.mixed_video_root}/index/libero_manifest.csv
+    mixed_video_oxe_openvla_manifest: ${paths.datasets.mixed_video_root}/index/oxe-openvla_manifest.csv
+    # Optional root for precomputed mixed-video latent sidecars referenced by
+    # manifest latent_path / video_latents_path columns.
+    mixed_video_latent_root: ${paths.datasets.mixed_video_root}/latents
+    mixed_video_hf_cache: ${paths.datasets.mixed_video_root}/hf_cache
+
+  simulators:
+    # Local RoboTwin simulator checkout containing envs/ and task_config/.
+    robotwin_root: /path/to/simulators/RoboTwin
+    # Local CALVIN checkout containing the calvin_env package. If CALVIN is
+    # installed into the active environment, this can be omitted locally.
+    calvin_root: /path/to/simulators/calvin
+
+  models:
+    # Base LingBot-compatible WAN visual model root.
+    lingbot_va_base: /path/to/models/lingbot-va-base
+
+  checkpoints:
+    # Full checkpoint roots for the current comparison set. The aliases keep
+    # active experiment YAMLs stable while each machine supplies its own roots.
+    parallel_stream_exact_libero_step_400: /path/to/checkpoints/parallel_stream_exact_libero_step_400
+    parallel_stream_exact_libero_step_1100_0402: /path/to/checkpoints/parallel_stream_exact_libero_step_1100_0402
+    parallel_stream_joint_libero_step_300: /path/to/checkpoints/parallel_stream_joint_libero_step_300
+    parallel_stream_joint_libero_step_600_0402: /path/to/checkpoints/parallel_stream_joint_libero_step_600_0402
+    # Exact parallel-stream and joint transformer exports.
+    parallel_stream_exact_libero_latest: ${paths.checkpoints.parallel_stream_exact_libero_step_400}/transformer
+    parallel_stream_joint_libero_step_400: /path/to/checkpoints/parallel_stream_joint_libero_step_400/transformer
+    parallel_stream_joint_libero_step_600: /path/to/checkpoints/parallel_stream_joint_libero_step_600/transformer
+    # Shared video-only exports used by LIBERO variants.
+    libero_videoonly_step_600: /path/to/runs/libero_videoonly/checkpoints/checkpoint_step_600/transformer
+    libero_videoonly_step_850: /path/to/runs/libero_videoonly/checkpoints/checkpoint_step_850/transformer
+    libero_videoonly_all_subsets_step_3500: /path/to/runs/causal_video_prediction_libero_video_only_base_all_subsets/checkpoints/checkpoint_step_3500/transformer
+
+  outputs:
+    # Default parent directory for new local training runs.
+    train_runs_root: outputs/train_runs

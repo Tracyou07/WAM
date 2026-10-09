@@ -1,0 +1,253 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gradientwam"
+version = "0.1.0"
+description = "GradientWAM: experimental variational sharing on the OpenWAM native pipeline."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE", "NOTICE", "LICENSES/*", "THIRD_PARTY_NOTICES.md"]
+authors = [
+    { name = "GradientWAM contributors" },
+    { name = "OpenWAM Team" },
+]
+keywords = ["robotics", "world action models", "world models"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Upstream = "https://github.com/OpenWAM/OpenWAM"
+Issues = "https://github.com/Tracyou07/WAM/issues"
+Repository = "https://github.com/Tracyou07/WAM"
+
+[project.scripts]
+gradientwam = "gradientwam.runner:main"
+gradientwam-distributed-train = "gradientwam.distributed_train:main"
+openwam-train = "open_wam.cli.train:main"
+openwam-eval = "open_wam.cli.eval:main"
+openwam-inspect-config = "open_wam.cli.inspect_config:main"
+openwam-validate-config = "open_wam.cli.validate_config:main"
+openwam-sanity = "open_wam.cli.sanity:main"
+openwam-sim-rollout = "open_wam.cli.sim_rollout:main"
+
+[project.optional-dependencies]
+core = []
+# Dataset preparation and bounded object storage, used together with [train].
+pretrain = [
+    "av>=12.0",
+    "boto3>=1.40",
+    "opencv-python-headless>=4.10,<5",
+]
+# Keep the characterized Transformers minor line bounded. Version 5.10 is the
+# first line containing the security fix required by the release audit.
+torch = [
+    "diffusers>=0.35.0,<0.38",
+    "einops>=0.8.0",
+    "huggingface_hub>=0.30",
+    "msgpack>=1.2.1",
+    "numpy>=1.26",
+    "pillow>=12.3.0",
+    "safetensors>=0.4.3",
+    "sentencepiece>=0.2.0",
+    "torch>=2.4",
+    "transformers>=5.10.0,<5.11",
+]
+train = [
+    "accelerate>=1.1.0",
+    "diffusers>=0.35.0,<0.38",
+    "einops>=0.8.0",
+    "h5py>=3.11.0",
+    "huggingface_hub>=0.30",
+    "imageio>=2.36.0",
+    "imageio-ffmpeg>=0.6.0",
+    "msgpack>=1.2.1",
+    "numpy>=1.26",
+    "pillow>=12.3.0",
+    "pyarrow>=18.0",
+    "safetensors>=0.4.3",
+    "sentencepiece>=0.2.0",
+    "torch>=2.4",
+    "transformers>=5.10.0,<5.11",
+]
+eval = [
+    "diffusers>=0.35.0,<0.38",
+    "einops>=0.8.0",
+    "h5py>=3.11.0",
+    "huggingface_hub>=0.30",
+    "imageio>=2.36.0",
+    "imageio-ffmpeg>=0.6.0",
+    "matplotlib>=3.10.8",
+    "msgpack>=1.2.1",
+    "numpy>=1.26",
+    "pillow>=12.3.0",
+    "pyarrow>=18.0",
+    "safetensors>=0.4.3",
+    "sentencepiece>=0.2.0",
+    "torch>=2.4",
+    "transformers>=5.10.0,<5.11",
+]
+tracking = [
+    "wandb>=0.25.1",
+]
+viz = [
+    "imageio>=2.36.0",
+    "imageio-ffmpeg>=0.6.0",
+    "matplotlib>=3.10.8",
+    "mujoco>=3.4",
+    "numpy>=1.26",
+]
+# Keep Hydra >=1.3.4 across simulator extras: it is the first release that
+# fixes the high-severity arbitrary-code-execution advisory GHSA-2cp2-2r3c-7p7r.
+libero = [
+    "bddl==1.0.1",
+    "cloudpickle>=3.1.2",
+    "easydict>=1.13",
+    "future>=1.0.0",
+    "gym==0.25.2",
+    "hydra-core>=1.3.4",
+    "robosuite==1.4.0",
+    "termcolor>=3.3.0",
+]
+calvin = [
+    "cloudpickle>=3.1.2",
+    "gym==0.25.2",
+    "hydra-core>=1.3.4",
+    "numpy>=1.26",
+]
+robotwin = [
+    "cloudpickle>=3.1.2",
+    "numpy>=1.26",
+]
+sim = [
+    "bddl==1.0.1",
+    "cloudpickle>=3.1.2",
+    "diffusers>=0.35.0,<0.38",
+    "easydict>=1.13",
+    "einops>=0.8.0",
+    "future>=1.0.0",
+    "gym==0.25.2",
+    "h5py>=3.11.0",
+    "huggingface_hub>=0.30",
+    "hydra-core>=1.3.4",
+    "imageio>=2.36.0",
+    "imageio-ffmpeg>=0.6.0",
+    "msgpack>=1.2.1",
+    "numpy>=1.26",
+    "pillow>=12.3.0",
+    "pyarrow>=18.0",
+    "robosuite==1.4.0",
+    "safetensors>=0.4.3",
+    "sentencepiece>=0.2.0",
+    "termcolor>=3.3.0",
+    "torch>=2.4",
+    "transformers>=5.10.0,<5.11",
+]
+docs = [
+    "mkdocs==1.6.1",
+]
+full = [
+    "accelerate>=1.1.0",
+    "av>=12.0",
+    "bddl==1.0.1",
+    "boto3>=1.40",
+    "cloudpickle>=3.1.2",
+    "diffusers>=0.35.0,<0.38",
+    "easydict>=1.13",
+    "einops>=0.8.0",
+    "future>=1.0.0",
+    "gym==0.25.2",
+    "h5py>=3.11.0",
+    "huggingface_hub>=0.30",
+    "hydra-core>=1.3.4",
+    "imageio>=2.36.0",
+    "imageio-ffmpeg>=0.6.0",
+    "matplotlib>=3.10.8",
+    "mkdocs==1.6.1",
+    "msgpack>=1.2.1",
+    "mujoco>=3.4",
+    "numpy>=1.26",
+    "opencv-python>=4.10.0",
+    "pillow>=12.3.0",
+    "pyarrow>=18.0",
+    "robosuite==1.4.0",
+    "safetensors>=0.4.3",
+    "sentencepiece>=0.2.0",
+    "termcolor>=3.3.0",
+    "torch>=2.4",
+    "transformers>=5.10.0,<5.11",
+    "wandb>=0.25.1",
+]
+
+[dependency-groups]
+dev = [
+    "pyflakes==3.4.0",
+    "pytest>=9.0.3",
+]
+audit = [
+    "pip-audit==2.10.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/open_wam", "src/gradientwam"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"configs/artifacts.sample.yaml" = "open_wam/resources/configs/artifacts.sample.yaml"
+"configs/evals" = "open_wam/resources/configs/evals"
+"configs/examples" = "open_wam/resources/configs/examples"
+"configs/experiments" = "open_wam/resources/configs/experiments"
+"configs/local_paths.sample.yaml" = "open_wam/resources/configs/local_paths.sample.yaml"
+"configs/simulators" = "open_wam/resources/configs/simulators"
+"notes/index/lerobot_consortium_hf_dataset_contracts.json" = "open_wam/resources/consortium/lerobot_consortium_hf_dataset_contracts.json"
+"notes/index/lerobot_consortium_hf_dataset_inventory.csv" = "open_wam/resources/consortium/lerobot_consortium_hf_dataset_inventory.csv"
+"notes/index/lerobot_consortium_hf_dataset_inventory.md" = "open_wam/resources/consortium/lerobot_consortium_hf_dataset_inventory.md"
+"notes/index/lerobot_consortium_hf_repo_ids.txt" = "open_wam/resources/consortium/lerobot_consortium_hf_repo_ids.txt"
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    ".gitignore",
+    "CITATION.bib",
+    "LICENSE",
+    "LICENSES",
+    "NOTICE",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "configs",
+    "docs",
+    "notes/index/lerobot_consortium_hf_dataset_contracts.json",
+    "notes/index/lerobot_consortium_hf_dataset_inventory.csv",
+    "notes/index/lerobot_consortium_hf_dataset_inventory.md",
+    "notes/index/lerobot_consortium_hf_repo_ids.txt",
+    "pyproject.toml",
+    "requirements",
+    "src",
+    "scripts",
+    "tests",
+    "algorithm",
+    "baselines",
+    "pytest.ini",
+    "AGENTS.md",
+]
+exclude = [
+    "/.grimp_cache",
+    "/configs/local_paths.yaml",
+]
+
+[tool.uv]
+package = true
+# GitPython is an indirect tracking dependency; constrain the reproducible
+# environment above the vulnerable 3.1.58 release.
+constraint-dependencies = ["gitpython>=3.1.59"]

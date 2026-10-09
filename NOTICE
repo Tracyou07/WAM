@@ -1,0 +1,32 @@
+OpenWAM Attribution Notice
+===========================
+
+Copyright (c) 2026 OpenWAM Team contributors.
+
+OpenWAM is work from the OpenWAM Team in the Stanford Vision and Learning Lab
+(SVL) at Stanford University.
+
+Required redistribution attribution
+-----------------------------------
+
+Under section 7(b) of the GNU Affero General Public License version 3,
+conveyed copies and modified versions of OpenWAM must preserve this notice in
+the source distribution and in accompanying documentation that presents
+authorship, attribution, or legal notices.
+
+Required software attribution:
+
+    OpenWAM Team, Stanford Vision and Learning Lab (SVL), Stanford University. OpenWAM, version 0.2.0, 2026.
+    https://github.com/OpenWAM/OpenWAM
+
+This requirement governs attribution distributed with the software. It does
+not claim rights over independent output produced by running the software.
+Research publications that use OpenWAM should cite the paper listed in
+CITATION.bib.
+
+GradientWAM modified distribution
+--------------------------------
+This independent derivative adds round02 variational shared/private K/V routing
+and portable delivery orchestration. Modification date: 2026-10-09.
+Project: https://github.com/Tracyou07/WAM
+The upstream attribution above is preserved; no endorsement is implied.

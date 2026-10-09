@@ -1,0 +1,293 @@
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from open_wam.configs import (
+    DualExpertPolicyConfig,
+    ParallelStreamPolicyConfig,
+    VideoActionProgram,
+    FeatureCacheScope,
+)
+from open_wam.evals import libero_policy_runtime as runtime
+from open_wam.models.policy_variants import (
+    PolicyOutputModality, PolicyInferenceCapabilities,
+)
+
+
+def test_generic_video_producer_is_only_admitted_for_explicit_producer_role() -> None:
+    pipeline = SimpleNamespace(
+        policy_variant=SimpleNamespace(inference_capabilities=PolicyInferenceCapabilities(
+            native_modalities=frozenset({PolicyOutputModality.VIDEO}),
+        ))
+    )
+
+    with pytest.raises(ValueError, match="action"):
+        runtime._validate_libero_policy_runtime(
+            pipeline,
+            runtime_role=runtime.LiberoPolicyRuntimeRole.NATIVE_POLICY,
+        )
+
+    runtime._validate_libero_policy_runtime(
+        pipeline,
+        runtime_role=runtime.LiberoPolicyRuntimeRole.VIDEO_PRODUCER,
+    )
+
+
+def test_conditional_consumer_role_requires_declared_clean_video() -> None:
+    with pytest.raises(ValueError, match="requires provided conditioning modalities"):
+        runtime._validate_runtime_role_inputs(
+            runtime.LiberoPolicyRuntimeRole.VIDEO_CONDITIONED_ACTION_CONSUMER,
+            action_route=runtime.PolicyActionRoute.GENERATED_VIDEO_THEN_ACTION,
+            provided_modalities=(),
+        )
+
+    runtime._validate_runtime_role_inputs(
+        runtime.LiberoPolicyRuntimeRole.VIDEO_CONDITIONED_ACTION_CONSUMER,
+        action_route=runtime.PolicyActionRoute.GENERATED_VIDEO_THEN_ACTION,
+        provided_modalities=(PolicyOutputModality.VIDEO,),
+    )
+
+
+@pytest.mark.parametrize(
+    "runtime_role",
+    (
+        runtime.LiberoPolicyRuntimeRole.NATIVE_POLICY,
+        runtime.LiberoPolicyRuntimeRole.VIDEO_PRODUCER,
+    ),
+)
+def test_only_action_consumer_may_declare_provided_conditioning_inputs(
+    runtime_role: runtime.LiberoPolicyRuntimeRole,
+) -> None:
+    action_route = (
+        runtime.PolicyActionRoute.NATIVE
+        if runtime_role is runtime.LiberoPolicyRuntimeRole.NATIVE_POLICY
+        else runtime.PolicyActionRoute.GENERATED_VIDEO_THEN_ACTION
+    )
+    with pytest.raises(
+        ValueError,
+        match="Only the video-conditioned action consumer",
+    ):
+        runtime._validate_runtime_role_inputs(
+            runtime_role,
+            action_route=action_route,
+            provided_modalities=(PolicyOutputModality.VIDEO,),
+        )
+
+
+def test_runtime_role_must_match_action_route() -> None:
+    with pytest.raises(ValueError, match="requires an explicit video-producer"):
+        runtime._validate_runtime_role_inputs(
+            runtime.LiberoPolicyRuntimeRole.NATIVE_POLICY,
+            action_route=runtime.PolicyActionRoute.GENERATED_VIDEO_THEN_ACTION,
+            provided_modalities=(),
+        )
+    with pytest.raises(ValueError, match="requires the generated-video action"):
+        runtime._validate_runtime_role_inputs(
+            runtime.LiberoPolicyRuntimeRole.VIDEO_PRODUCER,
+            action_route=runtime.PolicyActionRoute.NATIVE,
+            provided_modalities=(),
+        )
+
+
+@pytest.mark.parametrize("policy_type", (DualExpertPolicyConfig, ParallelStreamPolicyConfig))
+@pytest.mark.parametrize("program,required,role", (
+    (VideoActionProgram.FORWARD_DYNAMICS, PolicyOutputModality.ACTION, runtime.LiberoPolicyRuntimeRole.VIDEO_PRODUCER),
+    (VideoActionProgram.INVERSE_DYNAMICS, PolicyOutputModality.VIDEO, runtime.LiberoPolicyRuntimeRole.VIDEO_CONDITIONED_ACTION_CONSUMER),
+))
+def test_live_sim_validates_declared_future_inputs(policy_type, program, required, role):
+    from open_wam.configs import InferenceConfig
+    from open_wam.models.policy_variants.base import VideoActionPolicyVariant
+
+    policy = SimpleNamespace(config=policy_type(program=program), inference_config=InferenceConfig())
+    capabilities = VideoActionPolicyVariant.inference_capabilities.fget(policy)
+    pipeline = SimpleNamespace(policy_variant=SimpleNamespace(inference_capabilities=capabilities))
+    with pytest.raises(ValueError, match="clean future modalities"):
+        runtime._validate_libero_policy_runtime(pipeline, runtime_role=role)
+    runtime._validate_libero_policy_runtime(pipeline, runtime_role=role, provided_modalities=(required,))
+
+
+def test_custom_video_producer_declares_its_inputs_without_a_program_enum():
+    capabilities = PolicyInferenceCapabilities(
+        native_modalities=frozenset({PolicyOutputModality.VIDEO}),
+        required_future_modalities=frozenset({PolicyOutputModality.ACTION}),
+    )
+    pipeline = SimpleNamespace(policy_variant=SimpleNamespace(inference_capabilities=capabilities))
+    with pytest.raises(ValueError, match="clean future modalities"):
+        runtime._validate_libero_policy_runtime(
+            pipeline, runtime_role=runtime.LiberoPolicyRuntimeRole.VIDEO_PRODUCER,
+        )
+
+
+class _FakePipeline:
+    def __init__(self, calls: list[object]) -> None:
+        self.calls = calls
+        self.policy_variant = SimpleNamespace(
+            inference_capabilities=PolicyInferenceCapabilities(
+                native_modalities=frozenset(PolicyOutputModality),
+                feature_cache_scope=FeatureCacheScope.DENOISING_CALL,
+            ),
+            rollout_contract=SimpleNamespace(action_tokens_per_frame=4, startup_observation_frames=1),
+        )
+        self.default_temporal_geometry = SimpleNamespace(frame_chunk_size=4, attention_window_size=30)
+        self.visual_tower = SimpleNamespace(frontend=SimpleNamespace(temporal_stride=4))
+        self.training = True
+
+    def to(self, *, device: torch.device):
+        self.calls.append(("pipeline.to", str(device)))
+        return self
+
+    def module_topology(self):
+        return SimpleNamespace(action_expert_modules=())
+
+    def eval(self):
+        self.calls.append("pipeline.eval")
+        self.training = False
+        return self
+
+
+def test_load_libero_policy_runtime_preserves_composition_order_and_contract(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[object] = []
+    config_path = tmp_path / "resolved_config.yaml"
+    checkpoint_path = tmp_path / "checkpoint_step_10" / "model_state.pt"
+    config = SimpleNamespace(
+        policy_variant=DualExpertPolicyConfig(
+            program=VideoActionProgram.VIDEO_THEN_ACTION
+        ),
+        backbone=SimpleNamespace(
+            runtime_backbone_artifact_path="/unused/transformer"
+        ),
+        data=SimpleNamespace(
+            num_frames=4,
+            action_schema=SimpleNamespace(action_horizon=16),
+        ),
+        inference=SimpleNamespace(frame_chunk_size=4),
+    )
+    pipeline = _FakePipeline(calls)
+    runner = object()
+
+    def _load_config(path: Path, **kwargs):
+        calls.append(("load_config", path, kwargs))
+        return config
+
+    def _resolve_checkpoint(**kwargs):
+        calls.append(("resolve_checkpoint", kwargs))
+        return checkpoint_path
+
+    def _require_paradigm(value, **kwargs):
+        calls.append(("require_paradigm", value, kwargs))
+
+    def _build_pipeline(value):
+        calls.append(("build_pipeline", value))
+        return pipeline
+
+    def _load_checkpoint(value, path, **kwargs):
+        calls.append(("load_checkpoint", value, path, kwargs))
+        return SimpleNamespace(missing_keys=(), unexpected_keys=())
+
+    def _build_runner(value):
+        calls.append(("build_runner", value))
+        return runner
+
+    def _component_report(value, model, **kwargs):
+        calls.append(("component_report", value, model, kwargs))
+        return {"base": "report"}
+
+    def _log(label: str, payload: dict[str, object]) -> None:
+        calls.append(("log", label, payload.copy()))
+
+    monkeypatch.setattr(runtime, "load_experiment_config", _load_config)
+    monkeypatch.setattr(runtime, "_resolve_policy_checkpoint_path", _resolve_checkpoint)
+    monkeypatch.setattr(runtime, "require_current_libero_policy_paradigm", _require_paradigm)
+    monkeypatch.setattr(runtime, "build_variant_pipeline_from_config", _build_pipeline)
+    monkeypatch.setattr(runtime, "load_pipeline_checkpoint", _load_checkpoint)
+    monkeypatch.setattr(runtime, "VariantRolloutRunner", _build_runner)
+    monkeypatch.setattr(runtime, "_build_component_report", _component_report)
+    monkeypatch.setattr(runtime, "_print_log", _log)
+
+    loaded = runtime.load_libero_policy_runtime(
+        runtime.LiberoPolicyLoadOptions(
+            config=config_path,
+            checkpoint=checkpoint_path,
+            merge_checkpoint_runtime_config=False,
+            set_overrides=(),
+            source="test loader",
+            checkpoint_error="checkpoint required",
+            raw_window_frames=13,
+            startup_model_obs_frames=1,
+            startup_env_init_steps=5,
+            inference_window_size=30,
+            rollout_frame_chunk_size=None,
+            action_only_rollout=False,
+            policy_action_route="native",
+            execute_action_steps=None,
+            execute_frame_chunk_size=None,
+            frontend_encode_mode=runtime.CURRENT_FRONTEND_ENCODE_MODE,
+            reset_policy_state_each_chunk=False,
+            runtime_device="cpu",
+            action_device="cpu",
+            frontend_device="cpu",
+            decode_device="cpu",
+            allow_deprecated_libero_config=False,
+            allow_deprecated_frontend_encode_mode=False,
+            component_report_extra={
+                "caller": "single",
+                "runtime_role": "must_not_override_authoritative_role",
+            },
+        )
+    )
+
+    assert loaded.config is config
+    assert loaded.checkpoint_path == checkpoint_path
+    assert loaded.pipeline is pipeline
+    assert loaded.runner is runner
+    assert loaded.raw_window_frames == 13
+    assert loaded.startup_model_obs_frames == 1
+    assert loaded.startup_env_init_steps == 5
+    assert loaded.use_lingbot_streaming_vae is True
+    assert loaded.runtime_device == torch.device("cpu")
+    assert loaded.action_device == torch.device("cpu")
+    assert loaded.frontend_device == torch.device("cpu")
+    assert loaded.decode_device == torch.device("cpu")
+    assert loaded.component_report == {
+        "base": "report",
+        "feature_cache_scope": "denoising_call",
+        "checkpoint_file": str(checkpoint_path.resolve()),
+        "checkpoint_runtime_config_path": None,
+        "checkpoint_runtime_config_merged": False,
+        "pipeline_training_mode": False,
+        "runtime_role": runtime.LiberoPolicyRuntimeRole.NATIVE_POLICY.value,
+        "frontend_encode_mode": runtime.CURRENT_FRONTEND_ENCODE_MODE,
+        "rollout_frame_chunk_size": None,
+        "execute_action_steps": None,
+        "execute_frame_chunk_size": None,
+        "caller": "single",
+    }
+    assert [
+        entry[0] if isinstance(entry, tuple) else entry
+        for entry in calls
+    ] == [
+        "load_config",
+        "resolve_checkpoint",
+        "require_paradigm",
+        "build_pipeline",
+        "load_checkpoint",
+        "pipeline.to",
+        "pipeline.eval",
+        "build_runner",
+        "component_report",
+        "log",
+    ]
+    assert calls[-1][1] == "load_report"
+    assert calls[-1][2] == loaded.component_report
+    assert calls[0] == (
+        "load_config",
+        config_path,
+        {"checkpoint_runtime_compat": False},
+    )

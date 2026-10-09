@@ -1,0 +1,681 @@
+from __future__ import annotations
+
+from dataclasses import replace
+
+import torch
+
+from open_wam.configs import (
+    ActionSpace,
+    InferenceConfig,
+    ParallelRuntimeMode,
+    TemporalPositionMode,
+    TrainingConfig,
+)
+from open_wam.configs.backbone import SharedVideoTransformerConfig
+from open_wam.configs.policy_parallel_stream import ParallelStreamPolicyConfig
+from open_wam.configs.policy_video_action import supports_dynamics_routing
+from open_wam.contracts import SampleConstructionMetadata
+from open_wam.models.common.dynamics_objectives import (
+    DynamicsSamplePlan,
+    resolve_dynamics_rollout_plan,
+    resolve_dynamics_sample_plan,
+)
+from open_wam.models.visual_tower import VisualStageOutputs, VisualTower
+
+from ..base import VideoActionPolicyVariant
+from ..contracts import (
+    DecoderArtifactEnvelope,
+    PolicyInferContext,
+    PolicyGeneratedVideo,
+    PolicyInferOutput,
+    PolicyInferState,
+    PolicyPreparedInputs,
+    PolicyTemporalGeometry,
+    PolicyTrainBatch,
+    PolicyTrainOutput,
+    PolicyVisualStage,
+    RolloutCursor,
+)
+from open_wam.models.common.channel_action_adapter import ChannelActionAdapter
+from .action_adapter import build_action_adapter_spec
+from .conditioning import ParallelStreamConditioning
+from open_wam.models.decoder_artifacts import (
+    PARALLEL_STREAM_DECODER_ARTIFACT_CONTRACT,
+    ParallelDecoderInferArtifacts,
+    ParallelDecoderTrainArtifacts,
+)
+from .forward_execution import (
+    run_parallel_action_conditioned_train,
+    run_parallel_exact_train,
+)
+from .inference import run_parallel_inference
+from open_wam.models.common.video_action_state import VideoActionRolloutState
+from .reference_profile import (
+    LingbotReferenceRuntimeContract,
+    load_reference_profile,
+    validate_reference_profile,
+)
+from .training_exact_artifacts import (
+    prepare_parallel_action_conditioned_train_artifacts,
+    prepare_parallel_exact_train_artifacts,
+)
+from .training_prefix_artifacts import (
+    prepare_parallel_prefix_condition_exact_train_artifacts,
+)
+
+
+class ParallelStreamPolicyVariant(VideoActionPolicyVariant):
+    """LingBot-style parallel-stream policy variant.
+
+    The canonical parallel-stream path is exact-runtime-only. Training and inference
+    semantics live in role-owned parallel-stream modules and execute on the
+    shared runtime backbone; this variant intentionally avoids maintaining a
+    second local packed-sequence implementation.
+    """
+
+    @property
+    def action_tokens_per_frame(self) -> int:
+        return self.config.action_per_frame
+
+    def __init__(
+        self,
+        config: ParallelStreamPolicyConfig,
+        backbone_config: SharedVideoTransformerConfig,
+        training_config: TrainingConfig,
+        inference_config: InferenceConfig,
+        action_dim: int,
+        action_horizon: int,
+        num_frames: int,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.conditioning = ParallelStreamConditioning(config)
+        self.backbone_config = backbone_config
+        self.training_config = training_config
+        self.inference_config = inference_config
+        self.action_dim = action_dim
+        self.action_horizon = action_horizon
+        self.num_frames = num_frames
+        self.action_adapter = ChannelActionAdapter(
+            build_action_adapter_spec(config, model_action_dim=action_dim)
+        )
+        self.reference_profile = load_reference_profile(config.reference_profile)
+        self._validate_reference_runtime_config(self.inference_config)
+
+    @property
+    def source_action_adapter(self):
+        return self.action_adapter if self.action_adapter.spec is not None else None
+
+    def _validate_reference_runtime_config(
+        self,
+        inference_config: InferenceConfig,
+    ) -> None:
+        validate_reference_profile(
+            self.reference_profile,
+            LingbotReferenceRuntimeContract(
+                max_text_tokens=self.backbone_config.max_text_tokens,
+                action_dim=self.action_dim,
+                action_per_frame=self.config.action_per_frame,
+                policy_frame_chunk_size=self.config.frame_chunk_size,
+                inference_frame_chunk_size=inference_config.frame_chunk_size,
+                attn_window=inference_config.attention_window_size,
+                guidance_scale=inference_config.guidance_scale,
+                require_guidance_scale_match=supports_dynamics_routing(
+                    self.config.program
+                ),
+                action_guidance_scale=inference_config.action_guidance_scale,
+                video_num_inference_steps=inference_config.video_num_inference_steps,
+                action_num_inference_steps=inference_config.action_num_inference_steps,
+                video_exec_step=inference_config.video_exec_step,
+                video_sigma_shift=self.training_config.video_sigma_shift,
+                action_sigma_shift=self.training_config.action_sigma_shift,
+            ),
+        )
+
+    @property
+    def decoder_artifact_contract(self) -> str:
+        return PARALLEL_STREAM_DECODER_ARTIFACT_CONTRACT
+
+    @property
+    def source_action_channel_ids(self) -> tuple[int, ...]:
+        """Expose the adapter projection through the shared pipeline contract."""
+
+        adapter_spec = self.action_adapter.spec
+        if adapter_spec is None:
+            return ()
+        return adapter_spec.used_action_channel_ids
+
+    @property
+    def accepted_source_action_shapes(self) -> tuple[tuple[int, int], ...]:
+        """Accept raw or already-adapted actions for exact LingBot profiles."""
+
+        adapter_spec = self.action_adapter.spec
+        if adapter_spec is None:
+            return super().accepted_source_action_shapes
+        return tuple(
+            dict.fromkeys(
+                (
+                    (adapter_spec.raw_action_dim, self.action_horizon),
+                    (adapter_spec.model_action_dim, self.action_horizon),
+                )
+            )
+        )
+
+    def _runtime_mode_label(self) -> str:
+        return str(self.config.runtime_mode)
+
+    def required_visual_stages(self) -> tuple[PolicyVisualStage, ...]:
+        return (PolicyVisualStage.FRONTEND,)
+
+    def validate_pipeline_assembly(
+        self,
+        *,
+        data_action_dim: int,
+        num_frames: int,
+        backbone_num_layers: int,
+    ) -> None:
+        super().validate_pipeline_assembly(
+            data_action_dim=data_action_dim,
+            num_frames=num_frames,
+            backbone_num_layers=backbone_num_layers,
+        )
+        self._validate_action_layout(self.action_horizon, num_frames=num_frames)
+
+    def _validate_action_layout(self, action_horizon: int, *, num_frames: int) -> None:
+        expected_horizon = num_frames * self.config.action_per_frame
+        if action_horizon != expected_horizon:
+            raise ValueError(
+                "Parallel-stream variant requires `action_horizon == num_frames * action_per_frame`, "
+                f"got action_horizon={action_horizon}, num_frames={num_frames}, "
+                f"action_per_frame={self.config.action_per_frame}"
+            )
+
+    def prepare_train_inputs(
+        self,
+        visual_outputs: VisualStageOutputs,
+        batch: PolicyTrainBatch,
+    ) -> PolicyPreparedInputs:
+        observed_num_frames = int(visual_outputs.frontend.video_latents.shape[2])
+        self._validate_action_layout(
+            batch.actions.shape[1], num_frames=observed_num_frames
+        )
+        model_actions, model_action_mask = self._prepare_exact_train_actions(
+            batch,
+            device=visual_outputs.frontend.video_latents.device,
+            dtype=visual_outputs.frontend.video_latents.dtype,
+        )
+        sample_metadata = SampleConstructionMetadata.from_batch_metadata(
+            batch.extra.get("metadata")
+        )
+        dynamics_sample_plan = resolve_dynamics_sample_plan(
+            program=self.config.program,
+            sample_metadata=sample_metadata,
+        )
+        sampled_geometry = self._resolve_train_sampling_metadata(
+            sample_metadata=sample_metadata,
+            dynamics_sample_plan=dynamics_sample_plan,
+            observed_num_frames=observed_num_frames,
+        )
+        proprio_state = self.conditioning.resolve_train_proprio_context(batch)
+        per_chunk_proprio_payload = (
+            self.conditioning.resolve_train_hidden_proprio_context(
+                batch,
+                label="parallel-stream training",
+            )
+        )
+        condition_latents = self.conditioning.resolve_train_condition_latents(
+            batch,
+            video_latents=visual_outputs.frontend.video_latents,
+            dynamics_sample_plan=dynamics_sample_plan,
+        )
+        external_condition_prefix = self.conditioning.uses_external_condition_prefix(
+            context_prefix_frames_in_sample=sampled_geometry[
+                "context_prefix_frames_in_sample"
+            ],
+            dynamics_sample_plan=dynamics_sample_plan,
+        )
+        if external_condition_prefix:
+            if not isinstance(condition_latents, torch.Tensor):
+                raise ValueError(
+                    "`context_condition_latent_source=single_frame_condition_latent` with no "
+                    "in-sequence context requires precomputed condition_latents. "
+                    "Run scripts/augment_lerobot_latents_with_single_frame_condition.py with --source-frame-offset -1."
+                )
+            train_artifacts = prepare_parallel_prefix_condition_exact_train_artifacts(
+                backbone_config=self.backbone_config,
+                policy_config=self.config,
+                training_config=self.training_config,
+                video_latents=visual_outputs.frontend.video_latents,
+                actions=model_actions,
+                action_mask=model_action_mask,
+                text_emb=visual_outputs.frontend.conditioning.text_context,
+                condition_latents=condition_latents,
+                chunk_size_override=sampled_geometry["chunk_size"],
+                window_size_override=sampled_geometry["window_size"],
+                frame_shift=sampled_geometry["frame_shift"],
+                chunk_origin_frame=sampled_geometry["chunk_origin_frame"],
+                singleton_chunk_frame=sampled_geometry["singleton_chunk_frame"],
+                conditional_history_policy=sampled_geometry[
+                    "conditional_history_policy"
+                ],
+                sample_metadata=sample_metadata,
+                dynamics_sample_plan=dynamics_sample_plan,
+            )
+        elif (
+            self.config.runtime_mode
+            == ParallelRuntimeMode.LINGBOT_EXACT_ACTION_CONDITIONED
+        ):
+            train_artifacts = prepare_parallel_action_conditioned_train_artifacts(
+                backbone_config=self.backbone_config,
+                policy_config=self.config,
+                training_config=self.training_config,
+                video_latents=visual_outputs.frontend.video_latents,
+                actions=model_actions,
+                action_mask=model_action_mask,
+                text_emb=visual_outputs.frontend.conditioning.text_context,
+                condition_latents=condition_latents,
+                chunk_size_override=sampled_geometry["chunk_size"],
+                window_size_override=sampled_geometry["window_size"],
+                loss_frame_start=sampled_geometry["loss_frame_start"],
+                loss_frame_end=sampled_geometry["loss_frame_end"],
+                latent_loss_frame_start=sampled_geometry["latent_loss_frame_start"],
+                latent_loss_frame_end=sampled_geometry["latent_loss_frame_end"],
+                action_loss_frame_start=sampled_geometry["action_loss_frame_start"],
+                action_loss_frame_end=sampled_geometry["action_loss_frame_end"],
+                frame_shift=sampled_geometry["frame_shift"],
+                chunk_origin_frame=sampled_geometry["chunk_origin_frame"],
+                singleton_chunk_frame=sampled_geometry["singleton_chunk_frame"],
+                conditional_history_policy=sampled_geometry[
+                    "conditional_history_policy"
+                ],
+                sample_metadata=sample_metadata,
+                dynamics_sample_plan=dynamics_sample_plan,
+            )
+        else:
+            train_artifacts = prepare_parallel_exact_train_artifacts(
+                backbone_config=self.backbone_config,
+                policy_config=self.config,
+                training_config=self.training_config,
+                video_latents=visual_outputs.frontend.video_latents,
+                actions=model_actions,
+                action_mask=model_action_mask,
+                text_emb=visual_outputs.frontend.conditioning.text_context,
+                condition_latents=condition_latents,
+                chunk_size_override=sampled_geometry["chunk_size"],
+                window_size_override=sampled_geometry["window_size"],
+                loss_frame_start=sampled_geometry["loss_frame_start"],
+                loss_frame_end=sampled_geometry["loss_frame_end"],
+                latent_loss_frame_start=sampled_geometry["latent_loss_frame_start"],
+                latent_loss_frame_end=sampled_geometry["latent_loss_frame_end"],
+                action_loss_frame_start=sampled_geometry["action_loss_frame_start"],
+                action_loss_frame_end=sampled_geometry["action_loss_frame_end"],
+                frame_shift=sampled_geometry["frame_shift"],
+                chunk_origin_frame=sampled_geometry["chunk_origin_frame"],
+                singleton_chunk_frame=sampled_geometry["singleton_chunk_frame"],
+                conditional_history_policy=sampled_geometry[
+                    "conditional_history_policy"
+                ],
+            )
+        if proprio_state is not None:
+            train_artifacts.input_dict["proprio_state"] = proprio_state
+        self.conditioning.attach_train_hidden_proprio_context(
+            train_artifacts,
+            batch=batch,
+            video_latents=visual_outputs.frontend.video_latents,
+            payload=per_chunk_proprio_payload,
+        )
+        return PolicyPreparedInputs(
+            batch=batch,
+            variant_inputs={
+                "parallel_train_artifacts": train_artifacts,
+            },
+        )
+
+    def _resolve_train_sampling_metadata(
+        self,
+        *,
+        sample_metadata: SampleConstructionMetadata | None,
+        dynamics_sample_plan: DynamicsSamplePlan | None,
+        observed_num_frames: int,
+    ) -> dict[str, int | str | None]:
+        if sample_metadata is None:
+            sample_metadata = SampleConstructionMetadata(raw={})
+        dynamics_sequence = (
+            None if dynamics_sample_plan is None else dynamics_sample_plan.sequence
+        )
+        if dynamics_sequence is not None:
+            loss_frame_start, loss_frame_end = dynamics_sequence.loss_frame_range(
+                observed_num_frames=observed_num_frames,
+            )
+            latent_loss_frame_start, latent_loss_frame_end = (
+                loss_frame_start,
+                loss_frame_end,
+            )
+            action_loss_frame_start, action_loss_frame_end = (
+                loss_frame_start,
+                loss_frame_end,
+            )
+        else:
+            loss_frame_start, loss_frame_end = sample_metadata.frame_range_or_default(
+                observed_num_frames=observed_num_frames,
+                error_label="parallel-stream train loss-frame metadata",
+            )
+            latent_loss_frame_start, latent_loss_frame_end = (
+                sample_metadata.frame_range_or_default(
+                    observed_num_frames=observed_num_frames,
+                    start_key="latent_loss_frame_start",
+                    end_key="latent_loss_frame_end",
+                    default_start=loss_frame_start,
+                    default_end=loss_frame_end,
+                    error_label="parallel-stream train latent-loss metadata",
+                )
+            )
+            action_loss_frame_start, action_loss_frame_end = (
+                sample_metadata.frame_range_or_default(
+                    observed_num_frames=observed_num_frames,
+                    start_key="action_loss_frame_start",
+                    end_key="action_loss_frame_end",
+                    default_start=loss_frame_start,
+                    default_end=loss_frame_end,
+                    error_label="parallel-stream train action-loss metadata",
+                )
+            )
+        frame_shift = (
+            int(sample_metadata.frame_shift)
+            if self.config.temporal_position_mode == TemporalPositionMode.GLOBAL_SHIFTED
+            and sample_metadata.frame_shift is not None
+            else 0
+        )
+        chunk_origin_frame = (
+            dynamics_sequence.chunk_origin_frame
+            if dynamics_sequence is not None
+            else sample_metadata.chunk_origin_frame_for(
+                observed_num_frames=observed_num_frames,
+            )
+        )
+        singleton_chunk_frame = (
+            dynamics_sequence.singleton_chunk_frame
+            if dynamics_sequence is not None
+            else sample_metadata.singleton_chunk_frame_for(
+                observed_num_frames=observed_num_frames,
+            )
+        )
+        conditional_history_policy = (
+            dynamics_sequence.history_policy
+            if dynamics_sequence is not None
+            else sample_metadata.conditional_history_policy
+        )
+        return {
+            "chunk_size": sample_metadata.sampled_chunk_size_for(observed_num_frames),
+            "window_size": sample_metadata.sampled_window_size,
+            "loss_frame_start": loss_frame_start,
+            "loss_frame_end": loss_frame_end,
+            "latent_loss_frame_start": latent_loss_frame_start,
+            "latent_loss_frame_end": latent_loss_frame_end,
+            "action_loss_frame_start": action_loss_frame_start,
+            "action_loss_frame_end": action_loss_frame_end,
+            "frame_shift": frame_shift,
+            "context_prefix_frames_in_sample": (
+                dynamics_sequence.context_prefix_frames
+                if dynamics_sequence is not None
+                else sample_metadata.context_prefix_frames_in_sample
+            ),
+            "chunk_origin_frame": chunk_origin_frame,
+            "singleton_chunk_frame": singleton_chunk_frame,
+            "conditional_history_policy": conditional_history_policy,
+        }
+
+    def _prepare_exact_train_actions(
+        self,
+        batch: PolicyTrainBatch,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not self.action_adapter.supports_raw_actions:
+            if batch.actions.shape[-1] != self.action_dim:
+                raise ValueError(
+                    "Exact LingBot training expects model-space supervision when no action adapter is configured, "
+                    f"got action dim {batch.actions.shape[-1]} and model action dim {self.action_dim}."
+                )
+            action_mask = (
+                batch.action_mask.to(device=device, dtype=dtype)
+                if batch.action_mask is not None
+                else None
+            )
+            return batch.actions.to(device=device, dtype=dtype), action_mask
+
+        resolved_action_space = self.action_adapter.infer_action_space(batch.actions)
+        model_actions = self.action_adapter.to_model_action_sequence(
+            batch.actions,
+            action_space=resolved_action_space,
+            device=device,
+            dtype=dtype,
+        )
+        action_mask = batch.action_mask
+        if action_mask is None and resolved_action_space == ActionSpace.RAW:
+            action_mask = torch.ones_like(batch.actions)
+        model_action_mask = (
+            self.action_adapter.to_model_action_mask_sequence(
+                action_mask,
+                action_space=resolved_action_space,
+                device=device,
+                dtype=dtype,
+            )
+            if action_mask is not None
+            else None
+        )
+        return model_actions, model_action_mask
+
+    def _reference_action_channel_mask(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if self.action_adapter.spec is None:
+            return None
+        mask = torch.zeros(self.action_dim, device=device, dtype=dtype)
+        used_ids = torch.tensor(
+            self.action_adapter.spec.used_action_channel_ids,
+            device=device,
+            dtype=torch.long,
+        )
+        mask.index_fill_(0, used_ids, 1.0)
+        return mask.view(1, self.action_dim, 1, 1, 1)
+
+    def forward_train(
+        self,
+        visual_tower: VisualTower,
+        visual_outputs: VisualStageOutputs,
+        prepared_inputs: PolicyPreparedInputs,
+    ) -> PolicyTrainOutput:
+        del visual_outputs
+        # parallel-stream is intentionally exact-runtime-only. The shared backbone
+        # still owns the transformer weights, but train-time packing, attention
+        # profile selection, and projection semantics live in the exact runtime
+        # helper to preserve LingBot behavior.
+        reference_transformer = visual_tower.get_runtime_backbone(
+            action_dim=self.action_dim,
+        )
+        train_artifacts = prepared_inputs.variant_inputs["parallel_train_artifacts"]
+        self.conditioning.append_generalist_mode_text_token(
+            reference_transformer, train_artifacts
+        )
+        self.conditioning.append_train_proprio_text_context(
+            reference_transformer, train_artifacts
+        )
+        runtime_input_dict = dict(train_artifacts.input_dict)
+        runtime_input_dict.pop("proprio_state", None)
+        if (
+            self.config.runtime_mode
+            == ParallelRuntimeMode.LINGBOT_EXACT_ACTION_CONDITIONED
+        ):
+            latent_pred, action_pred = run_parallel_action_conditioned_train(
+                reference_transformer,
+                runtime_input_dict,
+            )
+        else:
+            latent_pred, action_pred = run_parallel_exact_train(
+                reference_transformer,
+                runtime_input_dict,
+            )
+        loss_weights = {
+            "latent": self.training_config.objective_weight("latent"),
+            "action": self.training_config.objective_weight("action"),
+        }
+        patch_size = (
+            self.backbone_config.patch_size_t,
+            self.backbone_config.patch_size_h,
+            self.backbone_config.patch_size_w,
+        )
+        decoder_payload = ParallelDecoderTrainArtifacts(
+            latent_pred=latent_pred,
+            runtime=train_artifacts,
+            loss_weights=loss_weights,
+            patch_size=patch_size,
+        )
+        return PolicyTrainOutput(
+            policy_features=action_pred,
+            metrics={
+                "packed_sequence_length": torch.tensor(
+                    float(action_pred.shape[1]), device=action_pred.device
+                )
+            },
+            decoder_artifacts=DecoderArtifactEnvelope(
+                contract=PARALLEL_STREAM_DECODER_ARTIFACT_CONTRACT,
+                payload=decoder_payload,
+                dynamics_objective=train_artifacts.dynamics_objective,
+            ),
+            aux={
+                "variant": self.config.name,
+                "runtime_mode": self.config.runtime_mode,
+                "debug": {
+                    "sampled_chunk_size": train_artifacts.input_dict["chunk_size"],
+                    "sampled_window_size": train_artifacts.input_dict["window_size"],
+                    "generalist_mode_text_token_count": train_artifacts.input_dict.get(
+                        "generalist_mode_text_token_count",
+                        0,
+                    ),
+                },
+            },
+        )
+
+    def prepare_infer_state(
+        self,
+        visual_tower: VisualTower,
+        visual_outputs: VisualStageOutputs,
+        context: PolicyInferContext,
+        previous_state: PolicyInferState | None = None,
+    ) -> PolicyInferState:
+        if previous_state is not None:
+            if isinstance(previous_state.variant_state, VideoActionRolloutState):
+                previous_state.variant_state.require_complete_video_history()
+            return previous_state
+        del visual_outputs
+        temporal_geometry = context.require_temporal_geometry()
+        cursor = RolloutCursor(
+            current_start_frame=0,
+            block_index=0,
+            chunk_size=temporal_geometry.frame_chunk_size,
+        )
+        return PolicyInferState(
+            cursor=cursor,
+            temporal_geometry=temporal_geometry,
+        )
+
+    def forward_infer_step(
+        self,
+        visual_tower: VisualTower,
+        visual_outputs: VisualStageOutputs,
+        context: PolicyInferContext,
+        infer_state: PolicyInferState,
+    ) -> PolicyInferOutput:
+        transformer = visual_tower.get_runtime_backbone(action_dim=self.action_dim)
+        parameter = next(transformer.parameters())
+        frontend = visual_outputs.frontend
+        if parameter.device != frontend.video_latents.device:
+            raise ValueError(
+                "Place the shared transformer on the observation device before inference."
+            )
+        history = infer_state.variant_state or VideoActionRolloutState()
+        state = self.conditioning.select_rollout_proprio_state(context.state)
+        proprio = self.conditioning.resolve_infer_proprio_context(
+            state,
+            label="inference",
+            previous_state=history.proprio_state,
+        )
+        hidden_proprio = self.conditioning.resolve_infer_hidden_proprio_context(
+            state,
+            label="inference",
+            previous_state=history.hidden_proprio_state,
+        )
+        plan = resolve_dynamics_rollout_plan(
+            program=self.config.program,
+            request=context.dynamics,
+        )
+        output_request = self.resolve_inference_output_request(context)
+        artifacts = run_parallel_inference(
+            transformer=transformer,
+            backbone_config=self.backbone_config,
+            policy_config=self.config,
+            training_config=self.training_config,
+            inference_config=self._resolve_inference_config(
+                context.require_temporal_geometry()
+            ),
+            action_dim=self.action_dim,
+            condition_latents=frontend.video_latents,
+            text_emb=frontend.conditioning.text_context,
+            negative_text_emb=frontend.conditioning.negative_text_context,
+            action_channel_mask=self._reference_action_channel_mask(
+                device=parameter.device,
+                dtype=frontend.video_latents.dtype,
+            ),
+            infer_state=infer_state,
+            dynamics=context.dynamics,
+            output_request=output_request,
+            context=context,
+            proprio_state=proprio,
+            hidden_proprio_state=hidden_proprio,
+        )
+        return PolicyInferOutput(
+            policy_features=artifacts.action_pred.to(frontend.video_latents),
+            generation_frame_start=artifacts.generation_frame_start,
+            generated_video=(
+                PolicyGeneratedVideo(
+                    latents=artifacts.predicted_latents,
+                    frame_start=artifacts.generation_frame_start,
+                    latent_space_identity=frontend.latent_space_identity,
+                )
+                if plan.semantics.video_loss_active
+                and artifacts.predicted_latents.shape[2]
+                else None
+            ),
+            next_state=artifacts.next_state,
+            decoder_artifacts=DecoderArtifactEnvelope(
+                contract=PARALLEL_STREAM_DECODER_ARTIFACT_CONTRACT,
+                payload=ParallelDecoderInferArtifacts(
+                    predicted_latents=artifacts.predicted_latents,
+                ),
+                dynamics_objective=plan.objective,
+            ),
+            aux={
+                "variant": self.config.name,
+                "runtime_mode": self.config.runtime_mode,
+                "predicted_latents": artifacts.predicted_latents,
+                "chunk_action_pred": artifacts.action_pred,
+                "debug": artifacts.debug,
+            },
+        )
+
+    def _resolve_inference_config(
+        self,
+        temporal_geometry: PolicyTemporalGeometry,
+    ) -> InferenceConfig:
+        resolved = replace(
+            self.inference_config,
+            frame_chunk_size=int(temporal_geometry.frame_chunk_size),
+            attention_window_size=int(temporal_geometry.attention_window_size),
+        )
+        self._validate_reference_runtime_config(resolved)
+        return resolved

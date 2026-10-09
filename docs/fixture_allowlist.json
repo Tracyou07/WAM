@@ -1,0 +1,68 @@
+[
+  {
+    "path": "tests/fixtures/causal_video_prediction/multichunk_rollout_v1.safetensors",
+    "bytes": 12644,
+    "sha256": "c288a49cd4389d4cc7cb3654fca0a1df7624216dbe736ae5edf546b49f76a404",
+    "purpose": "upstream synthetic regression fixture"
+  },
+  {
+    "path": "tests/fixtures/causal_video_prediction/training_step_v1.safetensors",
+    "bytes": 116444,
+    "sha256": "23b58447d9431a5ef292f2e95154e85f8f3161f028a214b72be28caa3afc3a97",
+    "purpose": "upstream synthetic regression fixture"
+  },
+  {
+    "path": "tests/fixtures/pretraining/bucket_pad1.safetensors",
+    "bytes": 225372,
+    "sha256": "09408bdf4d207215fdba06cf1ab9300bca4823131ade20a1284df414e0d0efa6",
+    "purpose": "upstream synthetic regression fixture"
+  },
+  {
+    "path": "tests/fixtures/pretraining/bucket_pad4.safetensors",
+    "bytes": 262308,
+    "sha256": "37eda479e9f85413906de993b446415ac1dc523b36ba79c11e0a3a27141f2e8a",
+    "purpose": "upstream synthetic regression fixture"
+  },
+  {
+    "path": "tests/fixtures/pretraining/packed_pad1.safetensors",
+    "bytes": 225372,
+    "sha256": "ef3356c8ce4b235dee43097e015f3b5cc9e7cc53080d2cb96fcf397b199d3159",
+    "purpose": "upstream synthetic regression fixture"
+  },
+  {
+    "path": "tests/fixtures/pretraining/packed_pad4.safetensors",
+    "bytes": 262308,
+    "sha256": "dc93b7bf536ec5570d482170c85d0b2010dd1a684fa2d177646cd11c4fbe13f2",
+    "purpose": "upstream synthetic regression fixture"
+  },
+  {
+    "path": "tests/fixtures/pretraining/padded_pad1.safetensors",
+    "bytes": 225372,
+    "sha256": "09408bdf4d207215fdba06cf1ab9300bca4823131ade20a1284df414e0d0efa6",
+    "purpose": "upstream synthetic regression fixture"
+  },
+  {
+    "path": "tests/fixtures/pretraining/padded_pad4.safetensors",
+    "bytes": 262308,
+    "sha256": "37eda479e9f85413906de993b446415ac1dc523b36ba79c11e0a3a27141f2e8a",
+    "purpose": "upstream synthetic regression fixture"
+  },
+  {
+    "path": "tests/fixtures/pretraining/processing.safetensors",
+    "bytes": 821472,
+    "sha256": "b876e30df24985efc84e382385811c6c691876a0e35fafab15a2cf0909e8d6a6",
+    "purpose": "upstream synthetic regression fixture"
+  },
+  {
+    "path": "tests/fixtures/public_tiny/artifacts/checkpoint_step_1/full_training_state.pt",
+    "bytes": 86,
+    "sha256": "f733aac9cc861758bdfa8497bb8e31e0a12ad1b6eb0eed4f56c7c09e333ec570",
+    "purpose": "upstream 86-byte text placeholder"
+  },
+  {
+    "path": "tests/fixtures/public_tiny/artifacts/checkpoint_step_1/model_state.pt",
+    "bytes": 86,
+    "sha256": "f733aac9cc861758bdfa8497bb8e31e0a12ad1b6eb0eed4f56c7c09e333ec570",
+    "purpose": "upstream 86-byte text placeholder"
+  }
+]

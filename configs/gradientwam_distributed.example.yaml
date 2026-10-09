@@ -1,0 +1,9 @@
+# Uses the direct-path assets and frozen optimizer recipe in this settings file.
+settings_config: gradientwam/variational_sharing.yaml
+
+# Produced by `gradientwam prepare`; contains exact train/heldout episode IDs.
+episode_split_json: ${GW_PREPARATION_ROOT}/metadata/episodes.json
+
+# Short clone/validation run. Increase this value to continue from a checkpoint.
+steps: 2
+eval_seed: 20261009

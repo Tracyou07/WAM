@@ -1,0 +1,160 @@
+# Text-conditioned video-only training with the exact video marginal of the
+# canonical LIBERO VTA contract. No action model stream or tokens are materialized.
+name: causal_video_prediction_libero_chunked_conditioned
+
+data:
+  dataset_name: libero
+  dataset_type: lerobot_v2_latent_local
+  local_root: "${paths.datasets.libero_root}"
+  replay_status_policy: include_all
+  val_replay_status_policy: null
+  require_replay_status: false
+  val_require_replay_status: false
+  empty_text_embedding_path: "${paths.datasets.empty_text_embedding}"
+  latent_subdir: latents
+  camera_names:
+    - observation.images.agentview_rgb
+    - observation.images.eye_in_hand_rgb
+  latent_camera_names:
+    - observation.images.agentview_rgb
+    - observation.images.eye_in_hand_rgb
+  canonical_height: 128
+  canonical_width: 256
+  num_frames: 4
+  frame_stride: 1
+  sample_stride: 1
+  episode_cache_size: 2
+  train_fraction: 1.0
+  split_seed: 0
+  train_batch_size: 1
+  val_batch_size: 1
+  num_workers: 8
+  view_layout:
+    - source_name: observation.images.agentview_rgb
+      canonical_name: image
+      top: 0
+      left: 0
+      height: 128
+      width: 128
+    - source_name: observation.images.eye_in_hand_rgb
+      canonical_name: wrist_image
+      top: 0
+      left: 128
+      height: 128
+      width: 128
+  action_schema:
+    action_dim: 7
+    action_horizon: 0
+    state_dim: 8
+    state_horizon: 0
+  action_target:
+    representation: raw
+    source_key: action
+    pose_source_key: observation.state
+  sample_construction:
+    mode: uniform_segment
+    sample_order_mode: replacement
+    chunk_size: 4
+    window_size: 64
+    randomize_geometry: true
+    segment_min_frames: 1000
+    segment_max_frames: 1000
+    segment_length_stride: 1
+    segment_locality_block_size: 1
+    randomize_segment_length: false
+    randomize_segment_start: false
+    require_full_segment: true
+    condition_source_frame_offset: -1
+    target_alignment: legacy
+    start_padding_frames: 0
+    task_start_power: 0.0
+    demo_count_power: 0.0
+    trajectory_start_power: 0.0
+    sample_weight_mode: uniform
+
+backbone:
+  implementation: shared_transformer
+  train_attn_mode: flex
+  infer_attn_mode: torch
+  pretrained_model_name_or_path: "${paths.models.lingbot_va_base}"
+  transformer_subdir: transformer
+  hidden_size: 3072
+  num_layers: 30
+  num_heads: 24
+  attention_head_dim: 128
+  ffn_dim: 14336
+  text_dim: 4096
+  max_text_tokens: 512
+  patch_size_t: 1
+  patch_size_h: 2
+  patch_size_w: 2
+  load_wan_vae_frontend: false
+  load_text_conditioning: false
+  load_reference_core_weights: true
+  reference_core_init_mode: video_only
+
+policy_variant:
+  name: causal_video_prediction
+  program: chunked_conditioned_video
+  attach_site: post_visual_core
+  hidden_size: 256
+  text_conditioning_mode: task_prompt
+  noisy_video_condition_prob: 0.5
+  use_activation_checkpointing: true
+
+action_decoder:
+  name: video_only_decoder
+  hidden_size: 256
+  action_dim: 7
+  action_horizon: 0
+
+training:
+  video_num_train_timesteps: 1000
+  video_sigma_shift: 5.0
+  chunk_size: 4
+  window_size: 64
+  optimizer_name: adamw
+  scheduler_name: constant_with_warmup
+  learning_rate: 1.0e-5
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+  warmup_steps: 10
+  gradient_accumulation_steps: 10
+  max_grad_norm: 2.0
+  num_steps: 10000
+  text_condition_dropout_prob: 0.1
+  enabled_objectives: [latent]
+  latent_loss_weight: 1.0
+  action_loss_weight: 0.0
+  trainable_components: [visual_tower.shared_video_backbone]
+  frozen_components:
+    - visual_tower.shared_action_runtime
+    - visual_tower.shared_runtime_adapters
+
+inference:
+  video_num_inference_steps: 20
+  guidance_scale: 5.0
+  # Opt in after validating numerical/task parity for the checkpoint.
+  use_cache: false
+  frame_chunk_size: 4
+  attention_window_size: 30
+
+trainer:
+  limit_train_batches: null
+  limit_val_batches: 0
+  runtime: composable
+  batch_adapter: latents
+  loop_policy: steps
+  strategy: fsdp
+  accelerator: gpu
+  precision: bf16-mixed
+  default_root_dir: "${paths.outputs.train_runs_root}"
+  save_interval: 100
+  max_checkpoints_to_keep: 3
+  checkpoint_mode: full_training_state
+  export_runtime_backbone: true
+  runtime_backbone_export_components: [visual_tower.shared_video_backbone]
+  enable_wandb: true
+  wandb_project: openwam-libero-video-pretrain
+  wandb_mode: online
