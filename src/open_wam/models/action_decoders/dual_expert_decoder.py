@@ -149,9 +149,12 @@ class DualExpertActionDecoder(ActionDecoder):
             latent_mse = diffusion_loss.new_zeros(())
             weighted_video_loss = diffusion_loss.new_zeros(())
 
-        total_loss = weighted_action_loss + weighted_video_loss
+        vrfm_kl_loss = policy_output.aux.get("vrfm_kl_loss", diffusion_loss.new_zeros(()))
+        total_loss = weighted_action_loss + weighted_video_loss + vrfm_kl_loss
         aux: dict[str, Any] = {
             "flow_pred": train_artifacts.action.flow_pred.detach(),
+            "task_losses": {"video": weighted_video_loss, "action": weighted_action_loss},
+            "vrfm_kl_loss": vrfm_kl_loss,
         }
         if train_artifacts.video is not None:
             aux.update(
@@ -169,6 +172,7 @@ class DualExpertActionDecoder(ActionDecoder):
             "video_diffusion_loss": latent_loss.detach(),
             "weighted_video_diffusion_loss": weighted_video_loss.detach(),
             "joint_loss": total_loss.detach(),
+            "vrfm_kl_loss": vrfm_kl_loss.detach(),
         }
         if route_result is not None:
             metrics.update({

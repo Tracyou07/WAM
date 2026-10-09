@@ -19,6 +19,7 @@ def _update(stack, batch, state, *, torch, deadline):
     model, strategy, optimizer = (stack[k] for k in ('model', 'strategy', 'optimizer'))
     model.train()
     losses = []
+    cagrad = stack.get('cagrad_accumulator')
     applied_lr = optimizer.param_groups[0]['lr']
     for _ in range(10):
         if time.monotonic() >= deadline:
@@ -26,6 +27,12 @@ def _update(stack, batch, state, *, torch, deadline):
         with strategy.autocast_context():
             result = stack['executor'].forward_train(batch)
             loss = result.loss / 10
+        if cagrad is not None:
+            if result.task_losses is None or result.task_active is None:
+                raise ValueError('CAGrad requires graph-bearing task losses and native activity masks.')
+            scaler = getattr(strategy, 'grad_scaler', None)
+            scale = float(scaler.get_scale()) if scaler is not None and scaler.is_enabled() else 1.0
+            cagrad.accumulate(result.task_losses, result.task_active, scale=scale * 0.1)
         if not torch.isfinite(loss).item():
             raise ValueError('Nonfinite loss; optimizer not advanced.')
         strategy.backward(loss)
@@ -33,6 +40,7 @@ def _update(stack, batch, state, *, torch, deadline):
         state.global_step += 1
         state.seen_batches += 1
         state.next_batch_index += 1
+    cagrad_report = cagrad.finalize(model.parameters()) if cagrad is not None else None
     strategy.unscale_(optimizer)
     norm = strategy.clip_grad_norm_(model.parameters(), 2.)
     if not torch.isfinite(norm).item():
@@ -42,12 +50,20 @@ def _update(stack, batch, state, *, torch, deadline):
     strategy.optimizer_step(optimizer)
     stack['scheduler'].step()
     strategy.zero_grad(optimizer)
+    if cagrad is not None:
+        from .cagrad_training import CAGradGradientAccumulator
+        stack['cagrad_accumulator'] = CAGradGradientAccumulator(
+            stack['cagrad_candidates'], c=stack['method_config'].cagrad_c
+        )
     state.optimizer_step += 1
     state.last_checkpoint_path = None
-    return {'optimizer_step': state.optimizer_step, 'microbatch_cursor': state.next_batch_index,
+    report = {'optimizer_step': state.optimizer_step, 'microbatch_cursor': state.next_batch_index,
             'mean_loss': sum(losses)/10, 'grad_norm': float(norm.detach().cpu()),
             'applied_learning_rate': applied_lr, 'next_learning_rate': stack['scheduler'].get_last_lr()[0],
             'optimizer_state_dtypes': _optimizer_state_dtypes(optimizer, torch)}
+    if cagrad_report is not None:
+        report['cagrad'] = cagrad_report
+    return report
 
 
 def run(settings, *, resume: Path | None = None):
@@ -96,7 +112,8 @@ def run(settings, *, resume: Path | None = None):
             stream.write(json.dumps({'event':event, **fields}, allow_nan=False)+'\n')
     def build(load):
         return _build_stack(config, base_checkpoint=settings.checkpoint, load_public_base=load,
-            checkpoint_sha256=settings.checkpoint_sha256, arm=settings.arm, route_seed=settings.route_seed, torch=torch)
+            checkpoint_sha256=settings.checkpoint_sha256, arm=settings.arm, route_seed=settings.route_seed,
+            torch=torch, method_config=settings.method_config)
     try:
         record('started', **metadata)
         stack = build(resume is None)
@@ -174,9 +191,9 @@ def _optimizer_state_dtypes(optimizer, torch) -> dict[str, Any]:
     }
 
 def _build_stack(config, *, base_checkpoint: Path, load_public_base: bool,
-                 checkpoint_sha256: str, arm: str, route_seed: int, torch) -> dict[str, Any]:
+                 checkpoint_sha256: str, arm: str, route_seed: int, torch,
+                 method_config=None) -> dict[str, Any]:
     from open_wam.configs.enums import TrainerAccelerator, TrainerPrecision
-    from open_wam.models.policy_variants.dual_expert.variational_sharing import configure_variational_sharing
     from open_wam.models.visual_tower.public_pretraining import load_public_video_checkpoint_into_tower
     from open_wam.models.visual_tower.tower import VisualTower
     from open_wam.pipelines.factory import build_variant_pipeline_from_config
@@ -184,24 +201,49 @@ def _build_stack(config, *, base_checkpoint: Path, load_public_base: bool,
     from open_wam.training.step_executor import LatentBatchAdapter, PipelineTrainStepExecutor
     from open_wam.training.strategies import SingleDeviceStrategy
 
-    tower = VisualTower(config.backbone, action_dim=7, state_dim=8)
+    tower = VisualTower(
+        config.backbone,
+        action_dim=int(config.data.action_schema.action_dim),
+        state_dim=int(config.data.action_schema.state_dim),
+    )
     if load_public_base:
         load_public_video_checkpoint_into_tower(
             tower, base_checkpoint,
             expected_sha256=checkpoint_sha256,
         )
     pipeline = build_variant_pipeline_from_config(config, visual_tower=tower)
-    sharing_audit = configure_variational_sharing(
-        pipeline, arm=arm, expected_layers=30, route_seed=route_seed
-    )
+    cagrad_candidates = ()
+    if method_config is None:
+        from open_wam.models.policy_variants.dual_expert.variational_sharing import configure_variational_sharing
+        sharing_audit = configure_variational_sharing(
+            pipeline, arm=arm, expected_layers=30, route_seed=route_seed
+        )
+    elif method_config.legacy_v02:
+        from open_wam.models.policy_variants.dual_expert.variational_sharing import configure_variational_sharing
+        sharing_audit = configure_variational_sharing(
+            pipeline, arm=method_config.legacy_arm, expected_layers=30, route_seed=route_seed
+        )
+    else:
+        from .cagrad_training import cagrad_candidate_parameters, configure_native_trainability
+        sharing_audit = configure_native_trainability(
+            pipeline, expected_layers=int(config.backbone.num_layers)
+        )
+        if method_config.uses_vrfm:
+            from open_wam.models.policy_variants.dual_expert.vrfm import configure_vrfm
+            sharing_audit['vrfm'] = configure_vrfm(
+                pipeline, latent_dim=method_config.latent_dim, kl_weight=method_config.kl_weight
+            )
+        if method_config.uses_cagrad:
+            cagrad_candidates = cagrad_candidate_parameters(pipeline)
     raw_model = pipeline
-    before_manifest, _ = _parameter_manifest(raw_model, expected_numel=2_600_806_456 if arm == "variational_sharing" else None)
+    expected_numel = 2_600_806_456 if arm == 'variational_sharing' and method_config is None else None
+    before_manifest, _ = _parameter_manifest(raw_model, expected_numel=expected_numel)
     strategy = SingleDeviceStrategy(
         accelerator=TrainerAccelerator.GPU, precision=TrainerPrecision.BF16
     )
     model = strategy.prepare_model(raw_model)
     after_manifest, trainable_ids = _parameter_manifest(
-        strategy.unwrap_model(model), expected_numel=2_600_806_456 if arm == "variational_sharing" else None
+        strategy.unwrap_model(model), expected_numel=expected_numel
     )
     if before_manifest != after_manifest:
         raise ValueError("training_trainable_manifest_changed_after_device_move")
@@ -214,6 +256,12 @@ def _build_stack(config, *, base_checkpoint: Path, load_public_base: bool,
     if optimizer_names != [[entry["name"] for entry in after_manifest]]:
         raise ValueError("training_optimizer_parameter_order_mismatch")
     scheduler = build_scheduler(optimizer, config.training)
+    cagrad_accumulator = None
+    if method_config is not None and method_config.uses_cagrad:
+        from .cagrad_training import CAGradGradientAccumulator
+        cagrad_accumulator = CAGradGradientAccumulator(
+            cagrad_candidates, c=method_config.cagrad_c
+        )
     adapter = LatentBatchAdapter()
     executor = PipelineTrainStepExecutor(
         pipeline=pipeline, batch_adapter=adapter, training_config=config.training
@@ -228,5 +276,8 @@ def _build_stack(config, *, base_checkpoint: Path, load_public_base: bool,
         "executor": executor,
         "parameter_manifest": after_manifest,
         "sharing_audit": sharing_audit,
+        "cagrad_accumulator": cagrad_accumulator,
+        "method_config": method_config,
+        "cagrad_candidates": cagrad_candidates,
         "optimizer_names": optimizer_names,
     }

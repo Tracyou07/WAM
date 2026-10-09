@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "gradientwam"
 version = "0.1.0"
-description = "GradientWAM: experimental variational sharing on the OpenWAM native pipeline."
+description = "GradientWAM: variational flow matching and conflict-averse gradients on OpenWAM."
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "AGPL-3.0-only"

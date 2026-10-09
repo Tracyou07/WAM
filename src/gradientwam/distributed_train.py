@@ -602,16 +602,119 @@ class RankAwareTrainingRuntime:
         output_dir: Path,
         eval_seed: int,
         identity: dict[str, Any],
+        method_config: Any | None = None,
+        cagrad_candidates: tuple[torch.nn.Parameter, ...] = (),
+        trainability_audit: dict[str, Any] | None = None,
     ) -> None:
         self._runtime = runtime
         self.__dict__.update(runtime.__dict__)
         self.output_dir = output_dir
         self.eval_seed = int(eval_seed)
         self.identity = identity
+        self.method_config = method_config
+        self.trainability_audit = trainability_audit or {}
         runtime._save_checkpoint = self._save_checkpoint
+        self._cagrad_accumulator = None
+        if method_config is not None and method_config.uses_cagrad:
+            from .cagrad_training import CAGradGradientAccumulator
+            from open_wam.configs.enums import StrategyName
+
+            if getattr(self.strategy, "kind", None) != StrategyName.DDP:
+                raise ValueError("CAGrad requires the GradientWAM DDP strategy")
+            if not cagrad_candidates:
+                raise ValueError("CAGrad method requires a nonempty structural candidate set")
+            self.cagrad_candidates = tuple(cagrad_candidates)
+            self._cagrad_accumulator = CAGradGradientAccumulator(
+                self.cagrad_candidates, c=method_config.cagrad_c
+            )
+            # CAGrad owns the only synchronization for this path. Forward the
+            # underlying module so DDP reducer hooks cannot sync partial/task grads.
+            self.step_executor.pipeline = self.strategy.unwrap_model(self.model)
+            runtime._train_micro_step = self._train_micro_step
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._runtime, name)
+
+    def _train_micro_step(self, batch) -> None:
+        from .cagrad_training import CAGradGradientAccumulator
+
+        device_batch = self.step_executor.batch_adapter.move_to_device(
+            batch, self.strategy.device
+        )
+        self.model.train()
+        accumulation_steps = max(1, int(self.config.training.gradient_accumulation_steps))
+        should_update = (self.train_state.global_step + 1) % accumulation_steps == 0
+        with self.strategy.autocast_context():
+            result = self.step_executor.forward_train(device_batch)
+            loss = result.loss / accumulation_steps
+        if result.task_losses is None or result.task_active is None:
+            raise ValueError("CAGrad requires graph-bearing task losses and native activity masks")
+        scaler = getattr(self.strategy, "grad_scaler", None)
+        scale = float(scaler.get_scale()) if scaler is not None and scaler.is_enabled() else 1.0
+        self._cagrad_accumulator.accumulate(
+            result.task_losses,
+            result.task_active,
+            scale=scale / accumulation_steps,
+        )
+        # The executor's pipeline is unwrapped, so this backward never enters
+        # DDP's reducer; the accumulated ordinary and task gradients are averaged below.
+        self.strategy.backward(loss)
+        self.train_state.global_step += 1
+        self.train_state.seen_batches += 1
+        self._accumulate_train_metrics(result.metrics)
+        if not should_update:
+            return
+
+        cagrad_report = self._cagrad_accumulator.finalize(self.model.parameters())
+        self.strategy.unscale_(self.optimizer)
+        if self.config.training.max_grad_norm is not None:
+            grad_norm = self.strategy.clip_grad_norm_(
+                self.model.parameters(), self.config.training.max_grad_norm
+            )
+        else:
+            grad_norm = None
+        if grad_norm is not None and not torch.isfinite(grad_norm):
+            self._runtime._report_nonfinite_gradients()
+            raise RuntimeError(
+                f"Non-finite gradient norm detected before optimizer step: {grad_norm.item()}."
+            )
+        from open_wam.training.optim import _normalize_optimizer_state_dtypes
+
+        _normalize_optimizer_state_dtypes(self.optimizer)
+        self.strategy.optimizer_step(self.optimizer)
+        self.scheduler.step()
+        self.strategy.zero_grad(self.optimizer)
+        self.train_state.optimizer_step += 1
+        self._cagrad_accumulator = CAGradGradientAccumulator(
+            self.cagrad_candidates, c=self.method_config.cagrad_c
+        )
+
+        metric_payload = self._finalize_accumulated_train_metrics()
+        if "latent_mse" in metric_payload:
+            metric_payload["latent_loss"] = metric_payload["latent_mse"]
+        if "action_mse" in metric_payload:
+            metric_payload["action_loss"] = metric_payload["action_mse"]
+        metric_payload["lr"] = float(self.scheduler.get_last_lr()[0])
+        if grad_norm is not None:
+            metric_payload["grad_norm"] = float(grad_norm.item())
+        metric_payload["cagrad_applied"] = float(cagrad_report["applied"])
+        metric_payload["cagrad_common_parameters"] = float(
+            cagrad_report["common_parameter_count"]
+        )
+        if (
+            self.config.trainer.log_every_n_steps <= 1
+            or self.train_state.optimizer_step % self.config.trainer.log_every_n_steps == 0
+        ):
+            self.log_sink.log_metrics(
+                step=self.train_state.optimizer_step, phase="train", metrics=metric_payload
+            )
+        self.log_sink.log_event(
+            name="cagrad_optimizer_window",
+            payload={
+                "optimizer_step": self.train_state.optimizer_step,
+                **cagrad_report,
+            },
+        )
 
     def _save_checkpoint(self, *, final: bool) -> None:
         from open_wam.training.runtime import TrainingRuntime
@@ -703,6 +806,8 @@ class RankAwareTrainingRuntime:
         if not self.strategy.is_main_process:
             return None
         model = self.strategy.unwrap_model(self.model)
+        was_training = bool(model.training)
+        previous_pipeline = self.step_executor.pipeline
         model.eval()
         self.step_executor.pipeline = model
         random.seed(self.eval_seed)
@@ -713,38 +818,42 @@ class RankAwareTrainingRuntime:
         action_total = 0.0
         world_total = 0.0
         sample_total = 0
-        with torch.no_grad():
-            for batch in self.val_loader:
-                device_batch = self.step_executor.batch_adapter.move_to_device(
-                    batch, self.strategy.device
-                )
-                with self.strategy.autocast_context():
-                    result = self.step_executor.forward_train(device_batch)
-                action_proxy, world_proxy, count = _heldout_batch_proxies(result)
-                action_total += float(action_proxy.cpu()) * count
-                world_total += float(world_proxy.cpu()) * count
-                sample_total += count
-        if sample_total <= 0:
-            raise ValueError("heldout evaluation produced no samples")
-        return {
-            "schema_version": 1,
-            "status": "heldout_denoising_proxy_completed",
-            "run_identity": self.identity,
-            "optimizer_step": int(self.train_state.optimizer_step),
-            "world_size": int(self.strategy.world_size),
-            "eval_seed": self.eval_seed,
-            "heldout_episode_ids": self.heldout_episode_ids,
-            "heldout_sample_count": sample_total,
-            "metrics": {
-                "action_denoising_proxy": action_total / sample_total,
-                "world_denoising_proxy": world_total / sample_total,
-            },
-            "semantics": (
-                "Native-timestep/mask flow-denoising proxies on heldout episodes; "
-                "variational action proxy is the observed-prior-weighted private/shared "
-                "branch MSE. These metrics are not closed-loop task success."
-            ),
-        }
+        try:
+            with torch.no_grad():
+                for batch in self.val_loader:
+                    device_batch = self.step_executor.batch_adapter.move_to_device(
+                        batch, self.strategy.device
+                    )
+                    with self.strategy.autocast_context():
+                        result = self.step_executor.forward_train(device_batch)
+                    action_proxy, world_proxy, count = _heldout_batch_proxies(result)
+                    action_total += float(action_proxy.cpu()) * count
+                    world_total += float(world_proxy.cpu()) * count
+                    sample_total += count
+            if sample_total <= 0:
+                raise ValueError("heldout evaluation produced no samples")
+            return {
+                "schema_version": 1,
+                "status": "heldout_denoising_proxy_completed",
+                "run_identity": self.identity,
+                "optimizer_step": int(self.train_state.optimizer_step),
+                "world_size": int(self.strategy.world_size),
+                "eval_seed": self.eval_seed,
+                "heldout_episode_ids": self.heldout_episode_ids,
+                "heldout_sample_count": sample_total,
+                "metrics": {
+                    "action_denoising_proxy": action_total / sample_total,
+                    "world_denoising_proxy": world_total / sample_total,
+                },
+                "semantics": (
+                    "Native-timestep/mask flow-denoising proxies on heldout episodes; "
+                    "VRFM uses its fixed unit-Gaussian prior and zero KL in eval mode. "
+                    "These metrics are not closed-loop task success."
+                ),
+            }
+        finally:
+            self.step_executor.pipeline = previous_pipeline
+            model.train(was_training)
 
 
 def _resolve_config_path(value: str, *, spec_path: Path) -> Path:
@@ -797,9 +906,6 @@ def _build_runtime(spec_path: Path, *, resume: str | None):
         TrainerAccelerator,
         TrainerPrecision,
         WandBMode,
-    )
-    from open_wam.models.policy_variants.dual_expert.variational_sharing import (
-        configure_variational_sharing,
     )
     from open_wam.models.visual_tower.public_pretraining import (
         load_public_video_checkpoint_into_tower,
@@ -932,12 +1038,40 @@ def _build_runtime(spec_path: Path, *, resume: str | None):
         tower.get_runtime_backbone(action_dim=int(config.action_decoder.action_dim))
         model.policy_variant.initialize_for_training(tower)
         trainability_report = apply_training_component_controls(model, config.training)
-        sharing_audit = configure_variational_sharing(
-            model,
-            arm=settings.arm,
-            expected_layers=int(config.backbone.num_layers),
-            route_seed=settings.route_seed,
-        )
+        cagrad_candidates: tuple[torch.nn.Parameter, ...] = ()
+        if settings.method_config.legacy_v02:
+            from open_wam.models.policy_variants.dual_expert.variational_sharing import (
+                configure_variational_sharing,
+            )
+
+            trainability_audit = configure_variational_sharing(
+                model,
+                arm=settings.arm,
+                expected_layers=int(config.backbone.num_layers),
+                route_seed=settings.route_seed,
+            )
+        else:
+            from .cagrad_training import (
+                TRAINABILITY_SCOPE_ID,
+                cagrad_candidate_parameters,
+                configure_native_trainability,
+            )
+
+            trainability_audit = configure_native_trainability(
+                model, expected_layers=int(config.backbone.num_layers)
+            )
+            if trainability_audit["scope_id"] != TRAINABILITY_SCOPE_ID:
+                raise ValueError("Unexpected GradientWAM trainability scope")
+            if settings.method_config.uses_vrfm:
+                from open_wam.models.policy_variants.dual_expert.vrfm import configure_vrfm
+
+                trainability_audit["vrfm"] = configure_vrfm(
+                    model,
+                    latent_dim=settings.method_config.latent_dim,
+                    kl_weight=settings.method_config.kl_weight,
+                )
+            if settings.method_config.uses_cagrad:
+                cagrad_candidates = cagrad_candidate_parameters(model)
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
         trainable_count = sum(
             parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -975,6 +1109,8 @@ def _build_runtime(spec_path: Path, *, resume: str | None):
         ).hexdigest()
         identity = {
             "arm": settings.arm,
+            "gradientwam": settings.method_config.identity(),
+            "trainability_scope": settings.identity()["trainability_scope"],
             "initialization_seed": seed,
             "rank_training_seed_rule": "seed_plus_rank",
             "route_seed": settings.route_seed,
@@ -1022,9 +1158,14 @@ def _build_runtime(spec_path: Path, *, resume: str | None):
             output_dir=output_dir,
             eval_seed=int(spec.get("eval_seed", 20261009)),
             identity=identity,
+            method_config=(
+                None if settings.method_config.legacy_v02 else settings.method_config
+            ),
+            cagrad_candidates=cagrad_candidates,
+            trainability_audit=trainability_audit,
         )
         adapted.heldout_episode_ids = split["heldout_episode_ids"]
-        adapted.sharing_audit = sharing_audit
+        adapted.sharing_audit = trainability_audit
         adapted.run_identity = identity
         if resume is not None:
             adapted.resume(resume)

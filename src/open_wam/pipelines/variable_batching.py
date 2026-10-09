@@ -248,6 +248,18 @@ def forward_variable_latent_batch(
         predictions.append(
             F.pad(prediction, (0, 0, 0, action_capacity - prediction.shape[1]))
         )
+    decoder_aux = {"batching_mode": batching_mode.value, "sample_count": len(samples)}
+    sample_aux = [output.decoder_output.aux for output in sample_outputs]
+    if all("task_losses" in aux for aux in sample_aux):
+        task_names = set(sample_aux[0]["task_losses"])
+        if any(set(aux["task_losses"]) != task_names for aux in sample_aux):
+            raise ValueError("Variable-batch samples must expose the same task losses")
+        decoder_aux["task_losses"] = {
+            name: torch.stack([aux["task_losses"][name] for aux in sample_aux]).mean()
+            for name in sorted(task_names)
+        }
+    if all("vrfm_kl_loss" in aux for aux in sample_aux):
+        decoder_aux["vrfm_kl_loss"] = torch.stack([aux["vrfm_kl_loss"] for aux in sample_aux]).mean()
     decoder = ActionDecoderTrainOutput(
         action_pred=torch.cat(predictions, dim=0),
         loss=torch.stack(
@@ -256,7 +268,7 @@ def forward_variable_latent_batch(
         metrics=_mean_metrics(
             tuple(output.decoder_output.metrics for output in sample_outputs)
         ),
-        aux={"batching_mode": batching_mode.value, "sample_count": len(samples)},
+        aux=decoder_aux,
     )
     policy = PolicyTrainOutput(
         policy_features=policies[0].policy_features.new_zeros(

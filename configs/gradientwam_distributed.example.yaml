@@ -1,5 +1,5 @@
 # Uses the direct-path assets and frozen optimizer recipe in this settings file.
-settings_config: gradientwam/variational_sharing.yaml
+settings_config: gradientwam/vrfm_cagrad.yaml
 
 # Produced by `gradientwam prepare`; contains exact train/heldout episode IDs.
 episode_split_json: ${GW_PREPARATION_ROOT}/metadata/episodes.json

@@ -167,6 +167,8 @@ def configure_variational_sharing(pipeline, *, arm: str, expected_layers: int = 
     from collections import Counter
     from open_wam.configs.enums import VariationalSharingArm, CurrentBlockCoupling, HistoryStreamVisibility
     policy = pipeline.policy_variant
+    if hasattr(policy, 'vrfm'):
+        raise ValueError('Legacy sharing cannot be enabled on a VRFM pipeline')
     selected = VariationalSharingArm(arm)
     if getattr(policy, "sharing_arm", None) is not None:
         raise ValueError("Sharing is configured exactly once after native initialization")

@@ -61,6 +61,7 @@ from .rollout_geometry import (
     resolve_dual_expert_sequence_actions_per_frame,
 )
 from .sequence_layout import build_action_grid_ids_for_sequence
+from .vrfm import VariationalFlowConditioning
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class DualExpertInferenceProgram:
     action_horizon: int
     sharing_arm: str | None = None
     routing_controller: PrefixRoutingController | None = None
+    vrfm: VariationalFlowConditioning | None = None
 
     def run(
         self,
@@ -258,6 +260,9 @@ class DualExpertInferenceProgram:
             if self.routing_controller is not None:
                 routing_options = self.routing_controller.begin_inference_chunk(observed_prefix, observed_mask, context.initial_route_uniform)
 
+        # One shared prior draw for the whole trajectory, including CFG calls.
+        vrfm_z = None if self.vrfm is None else self.vrfm.prior_sample(batch_size, device=device)
+
         def predict(step: VideoActionFlowInput, cache: DenoisingCache | None):
             layout = step.attention.token_layout
             action_needed = bool(
@@ -321,6 +326,12 @@ class DualExpertInferenceProgram:
                 if not self.conditioning.uses_legacy_prefix_contract()
                 else None
             )
+            video_latent_bias = None
+            if self.vrfm is not None:
+                video_latent_bias, action_bias = self.vrfm.condition(vrfm_z)
+                if action_pre is not None:
+                    action_pre = replace(action_pre,
+                        tokens=action_pre.tokens + action_bias.to(action_pre.tokens.dtype))
             video_flow, action_hidden = forward_dual_expert_packed_coupling_denoise(
                 visual_tower=visual_tower,
                 noisy_video_latents=step.noisy_video,
@@ -336,6 +347,7 @@ class DualExpertInferenceProgram:
                 denoising_cache=cache,
                 prefer_flex_attention=False,
                 video_hidden_context=video_hidden_context,
+                video_latent_bias=video_latent_bias,
                 **(routing_options if action_pre is not None else {}),
             )
             if action_pre is None:
@@ -464,6 +476,8 @@ class DualExpertInferenceProgram:
             ),
             generation_frame_start=int(generation_frame_start),
             aux={
+                'vrfm_z': None if vrfm_z is None else vrfm_z.detach(),
+                'vrfm_latent_source': None if vrfm_z is None else 'prior',
                 "variant": self.config.name,
                 "architecture": "dual_expert",
                 "condition_mode": str(self.config.condition_mode),
