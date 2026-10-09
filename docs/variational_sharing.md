@@ -1,5 +1,7 @@
 # Round02 variational sharing v0.2
 
+> Historical method: superseded by [VRFM + CAGrad](vrfm_cagrad.md). This document and its private K/V routes are retained only for explicitly marked legacy runs.
+
 This extension implements frozen contract SHA256
 `cb2f30413d8eedd9f307445ae603b4dbf0dffae4275957b39eb877af7ef6d64f`.
 Use the native legacy-prefix, decoupled-same-step/video-only program and strict

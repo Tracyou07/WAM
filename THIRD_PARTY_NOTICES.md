@@ -55,3 +55,7 @@ GradientWAM; see `README.md` and `NOTICE` for derivative attribution.
 
 The public converter adapts that recipe to the native OpenWAM frontend layout.
 External model weights retain their own upstream terms.
+
+## VRFM and CAGrad method references
+
+The new variational module and two-task CAGrad solver are independent implementations of published methods; no VRFM or CAGrad author source files are vendored. See `CITATION.bib`, `docs/vrfm_cagrad.md`, and `docs/cagrad_reference.md` for primary references, the reviewed official CAGrad implementation, and differences from its examples. The OpenWAM adaptation is not an official reproduction of either paper's experiments. An official VRFM code repository/license has not been independently verified for this delivery.

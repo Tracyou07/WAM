@@ -242,11 +242,11 @@ uses train episodes 0-7 and heldout episodes 8-9. It is an engineering example,
 not a benchmark split or a robot-control evaluation.
 
 ```bash
-python -m gradientwam.runner check-config --config configs/gradientwam/variational_sharing.yaml
-python -m gradientwam.runner prepare --config configs/gradientwam/variational_sharing.yaml \
+python -m gradientwam.runner check-config --config configs/gradientwam/vrfm_cagrad.yaml
+python -m gradientwam.runner prepare --config configs/gradientwam/vrfm_cagrad.yaml \
   --episodes-file configs/gradientwam/episodes.example.json --device cpu
 # Review the printed commands, then explicitly run the native encoders.
-python -m gradientwam.runner prepare --config configs/gradientwam/variational_sharing.yaml \
+python -m gradientwam.runner prepare --config configs/gradientwam/vrfm_cagrad.yaml \
   --episodes-file configs/gradientwam/episodes.example.json --device cpu --execute
 ```
 
@@ -263,7 +263,7 @@ Read `prompt_encoder_fingerprint` from the printed preparation result (also in
 
 ```bash
 export GW_PROMPT_FINGERPRINT="$(python -c 'import json,os; print(json.load(open(os.path.join(os.environ["GW_PREPARATION_ROOT"],"metadata/preparation.json")))["prompt_encoder_fingerprint"])')"
-python -m gradientwam.runner check-data --config configs/gradientwam/variational_sharing.yaml \
+python -m gradientwam.runner check-data --config configs/gradientwam/vrfm_cagrad.yaml \
   --episodes-file configs/gradientwam/episodes.example.json
 ```
 

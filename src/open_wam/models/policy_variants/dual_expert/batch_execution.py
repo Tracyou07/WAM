@@ -34,6 +34,7 @@ class DualExpertDenoiseRequest:
     frame_start: int = 0
     video_cross_attention_mask: torch.Tensor | None = None
     video_hidden_context: torch.Tensor | None = None
+    video_latent_bias: torch.Tensor | None = None
     routing_mode: str | None = None
     prior_shared: torch.Tensor | None = None
     route_choices: torch.Tensor | None = None
@@ -86,6 +87,7 @@ def forward_dual_expert_sequence_batch(
             text_context=request.text_context,
             frame_start=request.frame_start,
             video_hidden_context=request.video_hidden_context,
+            video_latent_bias=request.video_latent_bias,
         )
         for request in requests
     ]

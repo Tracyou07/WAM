@@ -60,6 +60,7 @@ from .dual_stream_execution import forward_dual_expert_packed_coupling_denoise
 from .modules import DualExpertActionExpert
 from .packed_block import DualExpertPackedBlockStack
 from .variational_sharing import PrefixRoutingController, validate_route_profile
+from .vrfm import VariationalFlowConditioning
 from .sequence_layout import (
     DualExpertTrainingLayout,
     build_action_grid_ids_for_sequence,
@@ -87,6 +88,7 @@ class DualExpertPackedTrainingProgram:
     initialize_action_expert: Callable[[VisualTower], None]
     sharing_arm: str | None = None
     routing_controller: PrefixRoutingController | None = None
+    vrfm: VariationalFlowConditioning | None = None
 
     def _maybe_initialize_action_expert(self, visual_tower: VisualTower) -> None:
         self.initialize_action_expert(visual_tower)
@@ -559,6 +561,26 @@ class DualExpertPackedTrainingProgram:
             action_grid_ids=packed_action_grid,
             hidden_context=packed_action_hidden_context,
         )
+        vrfm_options = {}
+        vrfm_aux = {}
+        if self.vrfm is not None:
+            if self.vrfm.training:
+                z, kl_loss = self.vrfm.posterior_sample(
+                    clean_video=video_latents, noisy_video=video_artifacts.noisy_latents,
+                    clean_action=clean_actions, noisy_action=noisy_actions,
+                    video_timesteps=video_artifacts.timesteps, action_timesteps=noisy_slot_timesteps,
+                    text_context=resolved_text, proprio_state=proprio_state,
+                    action_mask=clean_action_condition_mask,
+                )
+            else:
+                z = self.vrfm.prior_sample(video_latents.shape[0], device=video_latents.device)
+                kl_loss = z.new_zeros(())
+            video_bias, action_bias = self.vrfm.condition(z)
+            packed_action_pre = replace(packed_action_pre,
+                tokens=packed_action_pre.tokens + action_bias.to(packed_action_pre.tokens.dtype))
+            vrfm_options['video_latent_bias'] = video_bias
+            vrfm_aux = {'vrfm_z': z.detach(), 'vrfm_kl_loss': kl_loss,
+                        'vrfm_latent_source': 'posterior' if self.vrfm.training else 'prior'}
         packed_attention_profile = build_dual_expert_packed_coupling_attention_profile(
             build_dense_masks=False if defer_attention_masks else None,
             build_flex_masks=False if defer_attention_masks else None,
@@ -602,6 +624,7 @@ class DualExpertPackedTrainingProgram:
             video_cross_attention_mask=packed_video_cross_attention_mask,
             video_hidden_context=packed_video_hidden_context,
             **routing_options,
+            **vrfm_options,
         )
 
         def finish(
@@ -680,6 +703,7 @@ class DualExpertPackedTrainingProgram:
                     dynamics_objective=dynamics_objective,
                 ),
                 aux={
+                    **vrfm_aux,
                     "variant": self.config.name,
                     "architecture": "dual_expert",
                     "condition_mode": str(self.config.condition_mode),

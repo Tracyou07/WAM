@@ -2,18 +2,128 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 import hashlib
 import json
 import os
+import math
+from numbers import Real
 from pathlib import Path
 import re
 import tempfile
+from collections.abc import Mapping
 
 import yaml
 
-ARMS = ('native_joint', 'same_capacity_deterministic_kv_blend',
-        'variational_sharing', 'forced_private_world_gradient_off')
+class GradientWAMMethod(str, Enum):
+    BASELINE = 'baseline'
+    VRFM = 'vrfm'
+    CAGRAD = 'cagrad'
+    VRFM_CAGRAD = 'vrfm_cagrad'
+
+
+ARMS = tuple(method.value for method in GradientWAMMethod)
+TRAINABILITY_SCOPE_ID = 'native_action_plus_final_video_shared_kv_v1'
+LEGACY_ARMS = (
+    'native_joint',
+    'same_capacity_deterministic_kv_blend',
+    'variational_sharing',
+    'forced_private_world_gradient_off',
+)
 CAMERAS = ('observation.images.image', 'observation.images.wrist_image')
+
+
+@dataclass(frozen=True)
+class GradientWAMMethodConfig:
+    method: GradientWAMMethod | None = GradientWAMMethod.BASELINE
+    latent_dim: int = 32
+    kl_weight: float = 0.001
+    cagrad_c: float = 0.4
+    legacy_v02: bool = False
+    legacy_arm: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.legacy_v02:
+            if self.method is not None or self.legacy_arm not in LEGACY_ARMS:
+                raise ValueError('legacy_v02 requires exactly one supported legacy arm.')
+        elif self.method is None or self.legacy_arm is not None:
+            raise ValueError('New GradientWAM configs require a new method value.')
+        elif not isinstance(self.method, GradientWAMMethod):
+            object.__setattr__(self, 'method', GradientWAMMethod(self.method))
+        if type(self.latent_dim) is not int or self.latent_dim <= 0:
+            raise ValueError('gradientwam.latent_dim must be a positive integer.')
+        for name, value, upper_exclusive in (
+            ('kl_weight', self.kl_weight, None),
+            ('cagrad_c', self.cagrad_c, 1.0),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(f'gradientwam.{name} must be numeric.')
+            value = float(value)
+            if not math.isfinite(value) or value < 0 or (upper_exclusive is not None and value >= upper_exclusive):
+                interval = '[0, 1)' if upper_exclusive is not None else 'finite and nonnegative'
+                raise ValueError(f'gradientwam.{name} must be {interval}.')
+            object.__setattr__(self, name, value)
+
+    @property
+    def uses_vrfm(self) -> bool:
+        return self.method in (GradientWAMMethod.VRFM, GradientWAMMethod.VRFM_CAGRAD)
+
+    @property
+    def uses_cagrad(self) -> bool:
+        return self.method in (GradientWAMMethod.CAGRAD, GradientWAMMethod.VRFM_CAGRAD)
+
+    @property
+    def label(self) -> str:
+        return self.legacy_arm if self.legacy_v02 else self.method.value
+
+    def identity(self) -> dict:
+        if self.legacy_v02:
+            return {'method': 'legacy_v02', 'arm': self.legacy_arm, 'legacy_v02': True}
+        return {
+            'method': self.method.value,
+            'latent_dim': self.latent_dim,
+            'kl_weight': self.kl_weight,
+            'cagrad_c': self.cagrad_c,
+            'legacy_v02': False,
+        }
+
+
+def parse_method_config(raw: Mapping) -> GradientWAMMethodConfig:
+    if not isinstance(raw, Mapping):
+        raise TypeError('settings config must be a mapping.')
+    legacy = raw.get('legacy_v02', False)
+    if type(legacy) is not bool:
+        raise TypeError('legacy_v02 must be a boolean.')
+    if legacy:
+        if 'gradientwam' in raw:
+            raise ValueError('legacy_v02 cannot be combined with a new gradientwam method.')
+        arm = raw.get('arm')
+        if arm not in LEGACY_ARMS:
+            raise ValueError('legacy_v02 requires one supported historical arm.')
+        return GradientWAMMethodConfig(
+            method=None,
+            legacy_v02=True,
+            legacy_arm=arm,
+        )
+    if 'arm' in raw:
+        raise ValueError('Historical arm requires explicit legacy_v02: true.')
+    values = raw.get('gradientwam', {})
+    if not isinstance(values, Mapping):
+        raise TypeError('gradientwam must be a mapping.')
+    unknown = set(values) - {'method', 'latent_dim', 'kl_weight', 'cagrad_c'}
+    if unknown:
+        raise ValueError(f'Unknown gradientwam settings: {sorted(unknown)}.')
+    try:
+        method = GradientWAMMethod(values.get('method', GradientWAMMethod.BASELINE))
+    except ValueError as exc:
+        supported = ', '.join(method.value for method in GradientWAMMethod)
+        raise ValueError(f'Unknown GradientWAM method; choose one of: {supported}.') from exc
+    return GradientWAMMethodConfig(
+        method=method,
+        latent_dim=values.get('latent_dim', 32),
+        kl_weight=values.get('kl_weight', 0.001),
+        cagrad_c=values.get('cagrad_c', 0.4),
+    )
 
 
 def load_episode_split(path: Path) -> dict:
@@ -66,7 +176,7 @@ def _direct_path(value) -> Path:
 
 @dataclass(frozen=True)
 class Settings:
-    arm: str
+    method_config: GradientWAMMethodConfig
     seed: int
     route_seed: int
     episode_id: int
@@ -89,8 +199,15 @@ class Settings:
     def prompt_root(self) -> Path:
         return self.preparation_root / 'prompt_cache'
 
+    @property
+    def arm(self) -> str:
+        """Compatibility label for reports; new runs expose their method name."""
+        return self.method_config.label
+
     def identity(self) -> dict:
-        return {'arm': self.arm, 'seed': self.seed, 'route_seed': self.route_seed,
+        scope = 'legacy_v02' if self.method_config.legacy_v02 else TRAINABILITY_SCOPE_ID
+        return {'gradientwam': self.method_config.identity(), 'trainability_scope': scope,
+                'seed': self.seed, 'route_seed': self.route_seed,
                 'episode_id': self.episode_id, 'base_sha256': self.checkpoint_sha256,
                 'native_config_sha256': hashlib.sha256(json.dumps(self.native, sort_keys=True).encode()).hexdigest()}
 
@@ -112,9 +229,7 @@ class Settings:
 def load_settings(path: Path) -> Settings:
     path = path.resolve()
     raw = _expand(yaml.safe_load(path.read_text(encoding='utf-8')))
-    arm = raw['arm']
-    if arm not in ARMS:
-        raise ValueError('Unknown arm; choose one of the four frozen core arms.')
+    method_config = parse_method_config(raw)
     assets, run = raw['assets'], raw['run']
     names = ('dataset_root', 'frontend_root', 'tokenizer_root', 'preparation_root')
     paths = {name: _direct_path(assets[name]) for name in names}
@@ -159,7 +274,7 @@ def load_settings(path: Path) -> Settings:
         raise ValueError('Experiment differs from the frozen optimizer/loss recipe.')
     if native['backbone']['num_layers'] != 30 or native['policy_variant']['video_prefix_frames'] != 1:
         raise ValueError('The delivery requires the native 30-layer, one-prefix-frame profile.')
-    return Settings(arm=arm, seed=int(run['seed']), route_seed=int(run['route_seed']),
+    return Settings(method_config=method_config, seed=int(run['seed']), route_seed=int(run['route_seed']),
         episode_id=run['episode_id'], checkpoint=checkpoint, checkpoint_sha256=raw['checkpoint']['sha256'],
         output_root=output, prompt_fingerprint=assets['prompt_encoder_fingerprint'],
         max_minutes=int(run['max_minutes']), native=native, **paths)

@@ -320,6 +320,195 @@ def test_two_rank_gloo_runtime_training_sampling_and_resume(tmp_path: Path) -> N
     assert result["resumed_update_matches_uninterrupted"] is True
 
 
+class _CAGradToyPolicy(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.common = nn.Parameter(torch.tensor(0.2))
+        self.video_only = nn.Parameter(torch.tensor(-0.1))
+        self.action_only = nn.Parameter(torch.tensor(0.15))
+        self.posterior = nn.Parameter(torch.tensor(0.3))
+
+
+class _CAGradToyBatchAdapter:
+    @staticmethod
+    def move_to_device(batch, device):
+        return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
+
+
+class _CAGradToyExecutor:
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self.batch_adapter = _CAGradToyBatchAdapter()
+
+    def forward_train(self, batch):
+        model = self.pipeline
+        video = (model.common * batch["video_x"] + model.video_only - batch["video_y"]).square()
+        video = video * float(batch["video_active"])
+        action = (model.common * batch["action_x"] + model.action_only - batch["action_y"]).square()
+        kl = 0.3 * model.posterior.square()
+        return SimpleNamespace(
+            loss=video + action + kl,
+            task_losses={"video": video, "action": action},
+            task_active={"video": bool(batch["video_active"]), "action": True},
+            metrics={"toy_loss": (video + action + kl).detach()},
+        )
+
+
+def _cagrad_worker(rank: int, world_size: int, port: int, root: str) -> None:
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+        RANK=str(rank),
+        LOCAL_RANK=str(rank),
+        LOCAL_WORLD_SIZE=str(world_size),
+        WORLD_SIZE=str(world_size),
+    )
+    from gradientwam.cagrad import cagrad_coefficients
+    from gradientwam.distributed_train import RankAwareTrainingRuntime
+    from gradientwam.settings import GradientWAMMethod, GradientWAMMethodConfig
+    from open_wam.configs import ExperimentConfig, TrainerConfig, TrainingConfig
+    from open_wam.configs.enums import StrategyName, TrainerAccelerator, TrainerPrecision
+    from open_wam.training.runtime import TrainingRuntime
+    from open_wam.training.state import TrainState
+    from open_wam.training.strategies import DistributedStrategy
+
+    context = __import__("open_wam.training.launch", fromlist=["DistributedLaunchContext"]).DistributedLaunchContext.from_env()
+    strategy = DistributedStrategy(
+        accelerator=TrainerAccelerator.CPU,
+        precision=TrainerPrecision.FP32,
+        kind=StrategyName.DDP,
+        launch_context=context,
+        distributed_timeout_seconds=60,
+    )
+    torch.manual_seed(204)
+    raw_model = _CAGradToyPolicy()
+    initial = {name: value.detach().clone() for name, value in raw_model.state_dict().items()}
+    model = strategy.prepare_model(raw_model)
+    unwrapped = strategy.unwrap_model(model)
+    batches = [
+        {
+            "video_x": torch.tensor(1.0 + rank + micro),
+            "video_y": torch.tensor(0.2 * (micro - rank)),
+            "action_x": torch.tensor(0.5 + 0.3 * rank + micro),
+            "action_y": torch.tensor(-0.1 * (rank + micro)),
+            "video_active": not (rank == 1 and micro == 0),
+        }
+        for micro in range(2)
+    ]
+    all_batches: list[list[dict] | None] = [None] * world_size
+    dist.all_gather_object(all_batches, batches)
+
+    training = TrainingConfig(
+        gradient_accumulation_steps=2,
+        learning_rate=0.02,
+        beta1=0.9,
+        beta2=0.95,
+        weight_decay=0.05,
+        warmup_steps=0,
+        max_grad_norm=None,
+        num_steps=1,
+    )
+    trainer = TrainerConfig(
+        accelerator=TrainerAccelerator.CPU,
+        devices=world_size,
+        precision=TrainerPrecision.FP32,
+        strategy=StrategyName.DDP,
+        log_every_n_steps=100,
+        enable_checkpointing=False,
+        distributed_timeout_seconds=60,
+    )
+    config = ExperimentConfig(training=training, trainer=trainer)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=0.02, betas=(0.9, 0.95), weight_decay=0.05, foreach=False
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+    class _LogSink:
+        def log_event(self, **_kwargs):
+            pass
+
+        def log_metrics(self, **_kwargs):
+            pass
+
+    runtime = TrainingRuntime(
+        config=config,
+        model=model,
+        strategy=strategy,
+        train_loader=[],
+        val_loader=[],
+        step_executor=_CAGradToyExecutor(model),
+        optimizer=optimizer,
+        scheduler=scheduler,
+        checkpoint_manager=None,
+        log_sink=_LogSink(),
+        train_state=TrainState(run_name="cpu-cagrad-ddp"),
+        trainability_report=None,
+    )
+    adapted = RankAwareTrainingRuntime(
+        runtime,
+        output_dir=Path(root),
+        eval_seed=7,
+        identity={"gradientwam": {"method": "cagrad", "cagrad_c": 0.4}},
+        method_config=GradientWAMMethodConfig(method=GradientWAMMethod.CAGRAD),
+        cagrad_candidates=(unwrapped.common,),
+    )
+    for batch in batches:
+        adapted._train_micro_step(batch)
+
+    if rank == 0:
+        reference = _CAGradToyPolicy()
+        reference.load_state_dict(initial)
+        video_gradient = torch.zeros(())
+        action_gradient = torch.zeros(())
+        ordinary_gradients = {name: torch.zeros_like(parameter) for name, parameter in reference.named_parameters() if name != "common"}
+        for rank_batches in all_batches:
+            assert rank_batches is not None
+            for batch in rank_batches:
+                video = (reference.common * batch["video_x"] + reference.video_only - batch["video_y"]).square()
+                video = video * float(batch["video_active"])
+                action = (reference.common * batch["action_x"] + reference.action_only - batch["action_y"]).square()
+                total = video + action + 0.3 * reference.posterior.square()
+                if batch["video_active"]:
+                    video_gradient += torch.autograd.grad(video, reference.common, retain_graph=True)[0] / (2 * world_size)
+                action_gradient += torch.autograd.grad(action, reference.common, retain_graph=True)[0] / (2 * world_size)
+                grads = torch.autograd.grad(total, tuple(reference.parameters()))
+                for (name, _parameter), gradient in zip(reference.named_parameters(), grads, strict=True):
+                    if name != "common":
+                        ordinary_gradients[name] += gradient / (2 * world_size)
+        video64, action64 = video_gradient.double(), action_gradient.double()
+        gram = (
+            (float(video64 * video64), float(video64 * action64)),
+            (float(video64 * action64), float(action64 * action64)),
+        )
+        coefficients = cagrad_coefficients(gram, 0.4)
+        reference.common.grad = coefficients[0] * video_gradient + coefficients[1] * action_gradient
+        for name, parameter in reference.named_parameters():
+            if name != "common":
+                parameter.grad = ordinary_gradients[name]
+        reference_optimizer = torch.optim.AdamW(
+            reference.parameters(), lr=0.02, betas=(0.9, 0.95), weight_decay=0.05, foreach=False
+        )
+        reference_optimizer.step()
+        actual = strategy.unwrap_model(model)
+        for name, expected in reference.state_dict().items():
+            torch.testing.assert_close(actual.state_dict()[name], expected, rtol=1e-6, atol=1e-7)
+    gathered: list[dict[str, torch.Tensor] | None] = [None] * world_size
+    dist.all_gather_object(
+        gathered,
+        {name: value.detach().cpu() for name, value in unwrapped.state_dict().items()},
+    )
+    assert gathered[0] is not None and gathered[1] is not None
+    for name in gathered[0]:
+        torch.testing.assert_close(gathered[0][name], gathered[1][name], rtol=0, atol=0)
+    strategy.close()
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo backend is unavailable")
+def test_two_rank_cagrad_window_matches_global_reference(tmp_path: Path) -> None:
+    port = _free_port()
+    mp.spawn(_cagrad_worker, args=(2, port, str(tmp_path)), nprocs=2, join=True)
+
+
 def test_episode_split_json_is_strict_and_disjoint(tmp_path: Path) -> None:
     from gradientwam.distributed_train import load_episode_split
 

@@ -193,8 +193,13 @@ def load_pipeline_checkpoint(
     compatibility: CheckpointCompatibilityPolicy | str = (
         CheckpointCompatibilityPolicy.STRICT
     ),
+    require_model_only: bool = False,
 ) -> CheckpointLoadReport:
-    """Load one model checkpoint and initialize checkpoint-backed lazy modules."""
+    """Load one model checkpoint and initialize checkpoint-backed lazy modules.
+
+    require_model_only rejects training-state wrappers and non-tensor model
+    entries before normalizing keys; the default preserves existing formats.
+    """
 
     resolved_path = resolve_checkpoint_file(checkpoint_path)
     checkpoint = load_tensor_artifact(resolved_path, map_location=map_location)
@@ -203,6 +208,19 @@ def load_pipeline_checkpoint(
             f"Expected checkpoint mapping at {resolved_path}, "
             f"got {type(checkpoint).__name__}."
         )
+    if require_model_only:
+        wrappers = {"model_state_dict", "state_dict"} & checkpoint.keys()
+        if wrappers:
+            if len(wrappers) != 1 or len(checkpoint) != 1:
+                raise ValueError("Expected a model-only checkpoint without training state or extra fields")
+            model_state = checkpoint[next(iter(wrappers))]
+        else:
+            model_state = checkpoint
+        if not isinstance(model_state, Mapping) or not model_state or any(
+            not isinstance(key, str) or not isinstance(value, torch.Tensor)
+            for key, value in model_state.items()
+        ):
+            raise ValueError("Expected model-only state containing exclusively named tensors")
     state_dict = normalize_checkpoint_state_dict(checkpoint)
     runtime_state = pipeline.state_dict()
     missing_keys = tuple(key for key in runtime_state if key not in state_dict)

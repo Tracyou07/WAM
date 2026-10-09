@@ -43,6 +43,7 @@ def prepare_packed_video_inputs(
     text_context: torch.Tensor | None,
     frame_start: int = 0,
     video_hidden_context: torch.Tensor | None = None,
+    video_latent_bias: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Prepare the same visual stream for single-sequence and batched execution."""
     if noisy_video_latents.shape != clean_video_latents.shape:
@@ -97,6 +98,10 @@ def prepare_packed_video_inputs(
         action_mode=False,
     )
     video_hidden_states = video_prepared["hidden_states"]
+    if video_latent_bias is not None:
+        if video_latent_bias.shape != (batch_size, 1, video_hidden_states.shape[-1]):
+            raise ValueError('Video latent conditioning must have shape [B,1,H_video]')
+        video_hidden_states = video_hidden_states + video_latent_bias.to(video_hidden_states.dtype)
     if video_hidden_context is not None:
         if tuple(video_hidden_context.shape) != tuple(video_hidden_states.shape):
             raise ValueError(
@@ -166,6 +171,7 @@ def forward_dual_expert_packed_coupling_denoise(
     prefer_flex_attention: bool = True,
     video_cross_attention_mask: torch.Tensor | None = None,
     video_hidden_context: torch.Tensor | None = None,
+    video_latent_bias: torch.Tensor | None = None,
     routing_mode: str | None = None,
     prior_shared: torch.Tensor | None = None,
     route_choices: torch.Tensor | None = None,
@@ -190,6 +196,7 @@ def forward_dual_expert_packed_coupling_denoise(
         text_context=text_context,
         frame_start=frame_start,
         video_hidden_context=video_hidden_context,
+        video_latent_bias=video_latent_bias,
     )
     video_hidden_states = video_prepared["hidden_states"]
     video_text_hidden_states = video_prepared["text_hidden_states"]

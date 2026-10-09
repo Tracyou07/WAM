@@ -270,6 +270,7 @@ class DualExpertPolicyVariant(VideoActionPolicyVariant):
             initialize_action_expert=self._maybe_initialize_action_expert,
             sharing_arm=getattr(self, "sharing_arm", None),
             routing_controller=getattr(self, "routing_controller", None),
+            vrfm=getattr(self, "vrfm", None),
         ).run(
             visual_tower=visual_tower,
             visual_outputs=visual_outputs,
@@ -295,6 +296,7 @@ class DualExpertPolicyVariant(VideoActionPolicyVariant):
             initialize_action_expert=self._maybe_initialize_action_expert,
             sharing_arm=getattr(self, "sharing_arm", None),
             routing_controller=getattr(self, "routing_controller", None),
+            vrfm=getattr(self, "vrfm", None),
         ).run_batch(
             visual_tower=visual_tower,
             visual_outputs=visual_outputs,
@@ -321,6 +323,7 @@ class DualExpertPolicyVariant(VideoActionPolicyVariant):
             action_horizon=self.action_horizon,
             sharing_arm=getattr(self, "sharing_arm", None),
             routing_controller=getattr(self, "routing_controller", None),
+            vrfm=getattr(self, "vrfm", None),
         ).run(
             visual_tower=visual_tower,
             visual_outputs=visual_outputs,

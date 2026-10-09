@@ -1,6 +1,10 @@
-legacy_v02: true  # Historical shared/private routing, not the current method.
+# Active VRFM/CAGrad ablation; no legacy private K/V routing.
 experiment: native_experiment.yaml
-arm: native_joint
+gradientwam:
+  method: cagrad
+  latent_dim: 32
+  kl_weight: 0.001
+  cagrad_c: 0.4
 checkpoint:
   path: ${GW_CHECKPOINT}
   sha256: ${GW_CHECKPOINT_SHA256}

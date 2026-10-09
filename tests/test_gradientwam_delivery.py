@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from gradientwam.settings import ARMS, load_settings, load_episode_split
+from gradientwam.settings import ARMS, LEGACY_ARMS, GradientWAMMethod, load_settings, load_episode_split
 from gradientwam import train_smoke as smoke
 from gradientwam import checkpoint
 from open_wam.configs import TrainingConfig, enums
@@ -44,7 +44,15 @@ def test_four_configs_parse_without_assets(environment, arm):
     assert str(config.policy_variant.program) == 'decoupled_same_step'
     assert not settings.checkpoint.exists()
     assert replace(settings, output_root=environment/'resume').identity() == settings.identity()
-    assert replace(settings, arm='different').identity() != settings.identity()
+    changed_method = (
+        GradientWAMMethod.BASELINE
+        if settings.method_config.method is GradientWAMMethod.CAGRAD
+        else GradientWAMMethod.CAGRAD
+    )
+    changed = replace(settings, method_config=replace(
+        settings.method_config, method=changed_method
+    ))
+    assert changed.identity() != settings.identity()
 
 
 def test_preparation_print_only_and_source_overlap_rejected(environment, monkeypatch):
@@ -82,7 +90,7 @@ def test_invalid_episode_split_rejected(tmp_path,value):
         load_episode_split(path)
 
 
-@pytest.mark.parametrize('arm', ARMS)
+@pytest.mark.parametrize('arm', LEGACY_ARMS)
 def test_portable_build_attaches_arm_before_optimizer_on_native_tiny_cpu(tmp_path, monkeypatch, arm):
     from tests.test_variational_native_pipeline import fixture
     from open_wam.models.visual_tower import tower as tower_module
@@ -137,6 +145,226 @@ def test_portable_build_attaches_arm_before_optimizer_on_native_tiny_cpu(tmp_pat
     smoke._build_stack(config, base_checkpoint=path, load_public_base=False,
                        checkpoint_sha256=digest, arm=arm, route_seed=17, torch=torch)
     assert events == ['tower','factory','configure','optimizer']
+
+
+@pytest.mark.parametrize('method', list(GradientWAMMethod))
+def test_new_method_native_tiny_build_and_optimizer_update(tmp_path, monkeypatch, method):
+    from open_wam.data import LatentWAMBatch
+    from tests.test_variational_native_pipeline import fixture
+    from open_wam.training import strategies
+    from gradientwam.settings import GradientWAMMethodConfig, TRAINABILITY_SCOPE_ID
+
+    *_, policy_batch, latent, text, config = fixture(return_config=True)
+    def cpu_strategy(**_kwargs):
+        return SingleDeviceStrategy(
+            accelerator=enums.TrainerAccelerator.CPU,
+            precision=enums.TrainerPrecision.FP32,
+        )
+    monkeypatch.setattr(strategies, 'SingleDeviceStrategy', cpu_strategy)
+    method_config = GradientWAMMethodConfig(method=method)
+    stack = smoke._build_stack(
+        config,
+        base_checkpoint=tmp_path/'unused.pt',
+        load_public_base=False,
+        checkpoint_sha256='a'*64,
+        arm=method.value,
+        route_seed=31,
+        torch=torch,
+        method_config=method_config,
+    )
+    assert stack['sharing_audit']['scope_id'] == TRAINABILITY_SCOPE_ID
+    assert stack['parameter_manifest']
+    assert all(entry['dtype'] == 'torch.float32' for entry in stack['parameter_manifest'])
+    policy = stack['pipeline'].policy_variant
+    assert not hasattr(policy, 'routing_controller')
+    assert not any('private_video_to_k' in name for name, _ in stack['pipeline'].named_parameters())
+    assert hasattr(policy, 'vrfm') is method_config.uses_vrfm
+    if method_config.uses_cagrad:
+        assert stack['cagrad_candidates']
+        if method_config.uses_vrfm:
+            assert not {id(parameter) for parameter in policy.vrfm.posterior.parameters()} & {
+                id(parameter) for parameter in stack['cagrad_candidates']
+            }
+
+    state = TrainState()
+    latent_batch = LatentWAMBatch(
+        video_latents=latent,
+        actions=policy_batch.actions,
+        action_mask=policy_batch.action_mask,
+        state=policy_batch.state,
+        task_text=(None,),
+        text_context=text,
+        condition_latents=policy_batch.extra['condition_latents'],
+        proprio_context_frames=policy_batch.extra['proprio_context_frames'],
+        proprio_context_frames_mask=policy_batch.extra['proprio_context_frames_mask'],
+        metadata=({'valid_video_frames': 4},),
+    )
+    device_batch = stack['adapter'].move_to_device(latent_batch, stack['strategy'].device)
+    if method is GradientWAMMethod.VRFM_CAGRAD:
+        diagnostic = stack['executor'].forward_train(device_batch)
+        trainable = [
+            (name, parameter)
+            for name, parameter in stack['pipeline'].named_parameters()
+            if parameter.requires_grad
+        ]
+        video_grads = torch.autograd.grad(
+            diagnostic.task_losses['video'],
+            tuple(parameter for _, parameter in trainable),
+            retain_graph=True,
+            allow_unused=True,
+        )
+        action_grads = torch.autograd.grad(
+            diagnostic.task_losses['action'],
+            tuple(parameter for _, parameter in trainable),
+            retain_graph=True,
+            allow_unused=True,
+        )
+        nonzero_overlap = {
+            id(parameter)
+            for (_, parameter), video_grad, action_grad in zip(
+                trainable, video_grads, action_grads, strict=True
+            )
+            if video_grad is not None and action_grad is not None
+            and bool(torch.count_nonzero(video_grad).item())
+            and bool(torch.count_nonzero(action_grad).item())
+        }
+        posterior_ids = {
+            id(parameter) for parameter in policy.vrfm.posterior.parameters()
+        }
+        candidate_ids = {id(parameter) for parameter in stack['cagrad_candidates']}
+        assert nonzero_overlap <= candidate_ids | posterior_ids, (
+            'CAGrad candidates miss a parameter with nonzero gradients from both tasks'
+        )
+        action_only = [
+            (name, parameter, video_grad, action_grad)
+            for (name, parameter), video_grad, action_grad in zip(
+                trainable, video_grads, action_grads, strict=True
+            )
+            if 'action_expert.' in name or '.action_block.' in name
+            or 'vrfm.action_projection.' in name
+        ]
+        assert action_only
+        assert all(
+            gradient is None or not bool(torch.count_nonzero(gradient).item())
+            for _, _, gradient, _ in action_only
+        ), 'video-only attention mask must sever action-stream influence on video loss'
+        assert any(
+            gradient is not None and bool(torch.count_nonzero(gradient).item())
+            for _, _, _, gradient in action_only
+        ), 'action-only generator parameters must retain their native action gradients'
+        action_expert_blocks = [
+            item for item in action_only
+            if 'action_expert.' in item[0] or '.action_block.' in item[0]
+        ]
+        action_projection = [
+            item for item in action_only if 'vrfm.action_projection.' in item[0]
+        ]
+        max_abs = lambda gradient: 0.0 if gradient is None else float(gradient.detach().abs().max().item())
+        evidence = {
+            'action_expert_blocks_video_max_abs': max(
+                (max_abs(video_grad) for _, _, video_grad, _ in action_expert_blocks),
+                default=0.0,
+            ),
+            'action_expert_blocks_action_max_abs': max(
+                (max_abs(action_grad) for _, _, _, action_grad in action_expert_blocks),
+                default=0.0,
+            ),
+            'action_projection_video_max_abs': max(
+                (max_abs(video_grad) for _, _, video_grad, _ in action_projection),
+                default=0.0,
+            ),
+            'action_projection_action_max_abs': max(
+                (max_abs(action_grad) for _, _, _, action_grad in action_projection),
+                default=0.0,
+            ),
+        }
+        print(f'VIDEO_ONLY_MASK_GRAD_EVIDENCE {evidence}')
+    report = smoke._update(stack, device_batch, state, torch=torch, deadline=float('inf'))
+    assert report['optimizer_step'] == 1
+    if method_config.uses_cagrad:
+        assert report['cagrad']['applied'] is True
+        assert report['cagrad']['common_parameter_numel'] > 0
+    if method is GradientWAMMethod.VRFM_CAGRAD:
+        final_video = policy.packed_block_stack.packed_blocks[-1].video_block
+        graph_common_numel = sum(
+            parameter.numel()
+            for (_, parameter), video_grad, action_grad in zip(
+                trainable, video_grads, action_grads, strict=True
+            )
+            if id(parameter) in candidate_ids
+            and video_grad is not None and action_grad is not None
+        )
+        assert report['cagrad']['common_parameter_numel'] == graph_common_numel
+
+        # Strict step-1 -> step-2 resume also restores the RNG used by the VRFM
+        # posterior sample and starts with an empty CAGrad accumulation window.
+        from gradientwam import checkpoint
+        accumulator = stack['cagrad_accumulator']
+        assert all(not gradient.any() for gradient in accumulator.video_grads)
+        assert all(not gradient.any() for gradient in accumulator.action_grads)
+        metadata = {
+            'gradientwam': method_config.identity(),
+            'trainability_scope': TRAINABILITY_SCOPE_ID,
+        }
+        checkpoint_path = tmp_path/'vrfm_cagrad_step1.pt'
+        checkpoint.save_step1(
+            checkpoint_path,
+            model=stack['model'],
+            optimizer=stack['optimizer'],
+            scheduler=stack['scheduler'],
+            strategy=stack['strategy'],
+            train_state=state,
+            sampler_state={'next_microbatch_cursor': 10},
+            extra_generator_states={},
+            metadata=metadata,
+            cuda_devices=(),
+            max_bytes=2<<30,
+        )
+        direct_report = smoke._update(
+            stack, device_batch, state, torch=torch, deadline=float('inf')
+        )
+
+        torch.manual_seed(717)
+        resumed_stack = smoke._build_stack(
+            config,
+            base_checkpoint=tmp_path/'unused.pt',
+            load_public_base=False,
+            checkpoint_sha256='a'*64,
+            arm=method.value,
+            route_seed=31,
+            torch=torch,
+            method_config=method_config,
+        )
+        restored = checkpoint.load_step1(
+            checkpoint_path,
+            model=resumed_stack['model'],
+            optimizer=resumed_stack['optimizer'],
+            scheduler=resumed_stack['scheduler'],
+            strategy=resumed_stack['strategy'],
+            expected_metadata=metadata,
+            cuda_devices=(),
+        )
+        resumed_state = restored['train_state']
+        assert resumed_state.optimizer_step == 1 and resumed_state.global_step == 10
+        assert all(not gradient.any() for gradient in resumed_stack['cagrad_accumulator'].video_grads)
+        assert all(not gradient.any() for gradient in resumed_stack['cagrad_accumulator'].action_grads)
+        checkpoint.restore_rng(restored['rng_state'], cuda_devices=())
+        resumed_report = smoke._update(
+            resumed_stack,
+            device_batch,
+            resumed_state,
+            torch=torch,
+            deadline=float('inf'),
+        )
+        assert resumed_report == direct_report
+        assert resumed_state.optimizer_step == 2
+        for name, value in stack['model'].state_dict().items():
+            torch.testing.assert_close(
+                value,
+                resumed_stack['model'].state_dict()[name],
+                rtol=0,
+                atol=0,
+            )
 
 
 def test_actual_update_and_checkpoint_match_uninterrupted_tiny_cpu(tmp_path):

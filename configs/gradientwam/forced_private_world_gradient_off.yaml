@@ -1,3 +1,4 @@
+legacy_v02: true  # Historical shared/private routing, not the current method.
 experiment: native_experiment.yaml
 arm: forced_private_world_gradient_off
 checkpoint:

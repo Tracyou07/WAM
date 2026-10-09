@@ -33,6 +33,9 @@ class TrainStepResult:
     loss: torch.Tensor
     metrics: dict[str, torch.Tensor]
     output: VariantPipelineTrainOutput
+    task_losses: dict[str, torch.Tensor] | None = None
+    task_active: dict[str, bool] | None = None
+    vrfm_kl_loss: torch.Tensor | None = None
 
 
 class BatchAdapter(Protocol):
@@ -261,7 +264,28 @@ class PipelineTrainStepExecutor:
         if self.training_config.sample_loss_weight_mode != SampleLossWeightMode.NONE:
             metrics["unweighted_loss"] = output.decoder_output.loss.detach()
             metrics["sample_loss_weight"] = sample_loss_weight.detach()
-        return TrainStepResult(loss=loss, metrics=metrics, output=output)
+        raw_task_losses = output.decoder_output.aux.get("task_losses")
+        task_losses = (
+            {name: value * sample_loss_weight for name, value in raw_task_losses.items()}
+            if isinstance(raw_task_losses, Mapping)
+            and all(torch.is_tensor(value) for value in raw_task_losses.values())
+            else None
+        )
+        task_active = _native_dual_expert_task_activity(output)
+        raw_kl_loss = output.decoder_output.aux.get("vrfm_kl_loss")
+        vrfm_kl_loss = (
+            raw_kl_loss * sample_loss_weight
+            if torch.is_tensor(raw_kl_loss)
+            else None
+        )
+        return TrainStepResult(
+            loss=loss,
+            metrics=metrics,
+            output=output,
+            task_losses=task_losses,
+            task_active=task_active,
+            vrfm_kl_loss=vrfm_kl_loss,
+        )
 
     def _apply_text_condition_dropout(
         self,
@@ -353,6 +377,38 @@ def resolve_sample_loss_weight(
     if training_config.sample_loss_weight_max is not None:
         weights = weights.clamp_max(float(training_config.sample_loss_weight_max))
     return weights.mean()
+
+
+def _native_dual_expert_task_activity(
+    output: VariantPipelineTrainOutput,
+) -> dict[str, bool] | None:
+    if output.sample_outputs:
+        sample_activity = tuple(
+            _native_dual_expert_task_activity(sample)
+            for sample in output.sample_outputs
+        )
+        if any(activity is None for activity in sample_activity):
+            return None
+        return {
+            name: any(activity[name] for activity in sample_activity if activity is not None)
+            for name in ("video", "action")
+        }
+
+    envelope = output.policy_output.decoder_artifacts
+    if envelope is None or envelope.contract != "open_wam.dual_expert.decoder.v1":
+        return None
+    artifacts = envelope.payload
+    action_mask = artifacts.action.action_mask
+    action_active = (
+        action_mask is None
+        or bool(action_mask.detach().float().sum().item() > 0)
+    )
+    video = artifacts.video
+    video_active = (
+        video is not None
+        and bool(video.future_loss_mask.detach().float().sum().item() > 0)
+    )
+    return {"video": video_active, "action": action_active}
 
 
 def _per_sample_valid_action_steps(batch: PolicyTrainBatch) -> torch.Tensor:
