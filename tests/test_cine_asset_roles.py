@@ -43,4 +43,3 @@ def test_cine_encoder_assets_do_not_trigger_runtime_transformer_load(tmp_path, m
             backbone.pretrained_model_name_or_path, subdir
         ) == expected
     assert not (frontend / "transformer").exists()
-
