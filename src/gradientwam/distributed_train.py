@@ -177,25 +177,34 @@ def _episode_for_index(dataset: Any, index: int) -> int:
     if virtual_indices is not None:
         window_index = int(virtual_indices[index][0])
     else:
+        entries = getattr(dataset, "entries", None)
+        if entries is not None and len(entries) == len(dataset):
+            return int(entries[index]["episode_index"])
         windows = getattr(dataset, "windows", None)
         if windows is None or len(windows) != len(dataset):
             raise ValueError(
                 f"Cannot map sample indices to episodes for {type(dataset).__name__}"
             )
         window_index = int(index)
-    return int(dataset.windows[window_index].episode_index)
+    windows = getattr(dataset, "windows", None)
+    if windows is not None:
+        return int(windows[window_index].episode_index)
+    entries = getattr(dataset, "entries", None)
+    if entries is not None:
+        return int(entries[window_index]["episode_index"])
+    raise ValueError(f"Cannot map sample indices to episodes for {type(dataset).__name__}")
 
 
 def build_explicit_episode_datasets(
     config: Any, split: dict[str, list[int]], *, seed: int
 ):
     """Build native local-latent datasets from exact JSON episode IDs."""
-    from open_wam.configs import DataSplit, SampleOrderMode
+    from open_wam.configs import BatchingMode, DataSplit, SampleOrderMode
     from open_wam.data import build_train_val_latent_datasets, collate_latent_wam_samples
 
     if config.trainer.batch_adapter.value != "latents":
         raise ValueError("explicit episode filtering currently requires batch_adapter=latents")
-    if config.data.batching.mode.value != "strict":
+    if config.data.batching.mode is not BatchingMode.STRICT:
         raise ValueError("explicit distributed recipe currently requires strict latent batches")
     if config.data.sample_construction.sample_order_mode != SampleOrderMode.REPLACEMENT:
         raise ValueError("explicit distributed recipe requires native replacement sampling")
@@ -757,11 +766,12 @@ class RankAwareTrainingRuntime:
         )
 
     def run(self):
+        from open_wam.configs import LoopPolicyName
         from open_wam.training.loop_policies import StepLoopPolicy
 
         if self.config.training.num_steps is None:
             raise ValueError("GradientWAM distributed training requires training.num_steps")
-        if self.config.trainer.loop_policy.value != "steps":
+        if self.config.trainer.loop_policy is not LoopPolicyName.STEPS:
             raise ValueError("GradientWAM distributed training requires loop_policy=steps")
         self.log_sink.log_event(
             name="run_start",
@@ -769,7 +779,7 @@ class RankAwareTrainingRuntime:
                 "run_name": self.train_state.run_name,
                 "strategy": "ddp",
                 "world_size": self.strategy.world_size,
-                "heldout_split": "episode_split_json",
+                "heldout_split": getattr(self, "heldout_split_label", "episode_split_json"),
             },
         )
         self.strategy.zero_grad(self.optimizer)
@@ -907,28 +917,14 @@ def _build_runtime(spec_path: Path, *, resume: str | None):
         TrainerPrecision,
         WandBMode,
     )
-    from open_wam.models.visual_tower.public_pretraining import (
-        load_public_video_checkpoint_into_tower,
-    )
-    from open_wam.models.visual_tower.tower import VisualTower
-    from open_wam.pipelines.factory import build_variant_pipeline_from_config
-    from open_wam.training.checkpoints import CheckpointManager
-    from open_wam.training.controls import apply_training_component_controls
     from open_wam.training.data_loading import (
         preflight_runtime_dataset_artifacts,
     )
     from open_wam.training.launch import (
         DistributedLaunchContext,
-        validate_training_launch,
+        LaunchEnvironment,
     )
-    from open_wam.training.logging import build_log_sink
-    from open_wam.training.optim import build_optimizer, build_scheduler
-    from open_wam.training.runtime import TrainingRuntime, resolve_runtime_output_dir
-    from open_wam.training.state import TrainState
-    from open_wam.training.step_executor import (
-        PipelineTrainStepExecutor,
-        build_batch_adapter,
-    )
+    from open_wam.training.runtime import resolve_runtime_output_dir
     from open_wam.training.strategies import build_training_strategy
 
     spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
@@ -945,7 +941,7 @@ def _build_runtime(spec_path: Path, *, resume: str | None):
 
     settings = load_settings(settings_path)
     context = DistributedLaunchContext.from_env()
-    if context.environment.value != "torch_distributed":
+    if context.environment is not LaunchEnvironment.TORCH_DISTRIBUTED:
         raise ValueError("Launch with torchrun; implicit single-process fallback is disabled")
     seed = int(settings.seed)
     output_dir = Path(settings.output_root)
@@ -1013,96 +1009,7 @@ def _build_runtime(spec_path: Path, *, resume: str | None):
         validate_distributed_loader(
             train_loader, world_size=strategy.world_size, rank=strategy.rank
         )
-        if strategy.is_main_process:
-            output_dir.mkdir(parents=True, exist_ok=True)
-        strategy.barrier()
 
-        # Dataset construction is deterministic but reseed before any parameter
-        # initialization so four method arms share an identical common start.
-        random.seed(seed)
-        np.random.seed(seed % (2**32))
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-        tower = VisualTower(
-            config.backbone,
-            action_dim=config.action_decoder.action_dim,
-            state_dim=config.data.action_schema.state_dim,
-        )
-        load_public_video_checkpoint_into_tower(
-            tower,
-            settings.checkpoint,
-            expected_sha256=settings.checkpoint_sha256,
-        )
-        model = build_variant_pipeline_from_config(config, visual_tower=tower)
-        tower.get_runtime_backbone(action_dim=int(config.action_decoder.action_dim))
-        model.policy_variant.initialize_for_training(tower)
-        trainability_report = apply_training_component_controls(model, config.training)
-        cagrad_candidates: tuple[torch.nn.Parameter, ...] = ()
-        if settings.method_config.legacy_v02:
-            from open_wam.models.policy_variants.dual_expert.variational_sharing import (
-                configure_variational_sharing,
-            )
-
-            trainability_audit = configure_variational_sharing(
-                model,
-                arm=settings.arm,
-                expected_layers=int(config.backbone.num_layers),
-                route_seed=settings.route_seed,
-            )
-        else:
-            from .cagrad_training import (
-                TRAINABILITY_SCOPE_ID,
-                cagrad_candidate_parameters,
-                configure_native_trainability,
-            )
-
-            trainability_audit = configure_native_trainability(
-                model, expected_layers=int(config.backbone.num_layers)
-            )
-            if trainability_audit["scope_id"] != TRAINABILITY_SCOPE_ID:
-                raise ValueError("Unexpected GradientWAM trainability scope")
-            if settings.method_config.uses_vrfm:
-                from open_wam.models.policy_variants.dual_expert.vrfm import configure_vrfm
-
-                trainability_audit["vrfm"] = configure_vrfm(
-                    model,
-                    latent_dim=settings.method_config.latent_dim,
-                    kl_weight=settings.method_config.kl_weight,
-                )
-            if settings.method_config.uses_cagrad:
-                cagrad_candidates = cagrad_candidate_parameters(model)
-        parameter_count = sum(parameter.numel() for parameter in model.parameters())
-        trainable_count = sum(
-            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
-        )
-        trainability_report = replace(
-            trainability_report,
-            total_parameters=parameter_count,
-            trainable_parameters=trainable_count,
-        )
-        model = strategy.prepare_model(model)
-        rank_seed = seed + int(strategy.rank)
-        random.seed(rank_seed)
-        np.random.seed(rank_seed % (2**32))
-        torch.manual_seed(rank_seed)
-        if strategy.device.type == "cuda":
-            torch.cuda.manual_seed(rank_seed)
-        batch_adapter = build_batch_adapter(config.trainer.batch_adapter)
-        step_executor = PipelineTrainStepExecutor(
-            pipeline=model,
-            batch_adapter=batch_adapter,
-            training_config=config.training,
-        )
-        checkpoint_manager = CheckpointManager(
-            root_dir=Path(config.trainer.checkpoint_dir),
-            config=config,
-            checkpoint_mode=config.trainer.checkpoint_mode,
-            max_checkpoints_to_keep=config.trainer.max_checkpoints_to_keep,
-        )
-        run_name = config.trainer.run_name or config.name
-        # A two-step smoke can continue to a longer limit or a fresh output
-        # directory, while recipe changes remain part of the identity.
         config_sha256 = _experiment_config_identity_sha256(config)
         split_sha256 = hashlib.sha256(
             json.dumps(split, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1128,48 +1035,21 @@ def _build_runtime(spec_path: Path, *, resume: str | None):
                 * accumulation_steps
             ),
         }
-        if strategy.is_main_process:
-            (output_dir / "run_identity.json").write_text(
-                json.dumps(identity, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-        strategy.barrier()
-        optimizer = build_optimizer(model, config.training)
-        scheduler = build_scheduler(optimizer, config.training)
-        runtime = TrainingRuntime(
+        from .runtime_factory import build_rank_aware_runtime
+
+        return build_rank_aware_runtime(
+            settings=settings,
             config=config,
-            model=model,
             strategy=strategy,
             train_loader=train_loader,
             val_loader=val_loader,
-            step_executor=step_executor,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            checkpoint_manager=checkpoint_manager,
-            log_sink=build_log_sink(
-                config=config, output_dir=output_dir, run_name=run_name, strategy=strategy
-            ),
-            train_state=TrainState(run_name=run_name),
-            trainability_report=trainability_report,
-            dataset_artifacts=dataset_artifacts,
-        )
-        adapted = RankAwareTrainingRuntime(
-            runtime,
             output_dir=output_dir,
-            eval_seed=int(spec.get("eval_seed", 20261009)),
+            dataset_artifacts=dataset_artifacts,
             identity=identity,
-            method_config=(
-                None if settings.method_config.legacy_v02 else settings.method_config
-            ),
-            cagrad_candidates=cagrad_candidates,
-            trainability_audit=trainability_audit,
+            heldout_episode_ids=split["heldout_episode_ids"],
+            eval_seed=int(spec.get("eval_seed", 20261009)),
+            resume=resume,
         )
-        adapted.heldout_episode_ids = split["heldout_episode_ids"]
-        adapted.sharing_audit = trainability_audit
-        adapted.run_identity = identity
-        if resume is not None:
-            adapted.resume(resume)
-        return adapted
     except BaseException:
         strategy.close()
         raise

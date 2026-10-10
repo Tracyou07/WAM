@@ -6,6 +6,7 @@ from open_wam.configs import DataConfig
 
 from .latent_contracts import LatentWAMSample
 from .latent_synthetic import SyntheticLatentWindowDataset
+from .cine_v3_latent import build_cine_latent_train_val_datasets
 from .lerobot_v2_latent_artifacts import resolve_local_lerobot_latent_artifacts
 from .lerobot_v2_latent_factory import (
     build_local_lerobot_latent_train_val_datasets,
@@ -36,6 +37,7 @@ def _build_synthetic_latent_datasets(
 
 
 register_latent_dataset_builder("synthetic_latent", _build_synthetic_latent_datasets)
+register_latent_dataset_builder("cine_v3_latent", build_cine_latent_train_val_datasets)
 register_latent_dataset_builder("synthetic_robotwin", _build_synthetic_latent_datasets)
 register_latent_dataset_builder("synthetic_multiview", _build_synthetic_latent_datasets)
 register_latent_dataset_builder(

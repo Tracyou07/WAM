@@ -4,6 +4,8 @@ OpenWAM is the backbone. A continuous variational latent conditions both video a
 
 本项目用变分潜变量区分可能的未来，用 CAGrad 协调视频与动作联合学习。提供 baseline、仅 VRFM、仅 CAGrad、VRFM+CAGrad 四组配置，以及数据准备、1/2/8 卡训练、独立留出验证和断点恢复入口。
 
+**RM75/Cine LeRobot v3 数据请使用独立入口 `gradientwam-cine`：** 支持单 `color` 相机、30 FPS、7 维位置/四元数状态与原始 7 维关节命令。配置位于 `configs/cine_v3/`；完整命令见 [Cine v3 使用说明](docs/cine_v3.md)。下文的 `gradientwam` 命令继续用于原 LIBERO 数据，两个入口共用模型与训练算法。
+
 **Status:** this is a research implementation, not a validated control policy. Engineering checks are listed in [validation](docs/validation.md). Full-width CUDA execution, actual eight-GPU training and robot/simulator gains must be established separately. Public OpenWAM weights initialize the video model, not a trained action policy. Older externally launched v0.2 experiments are a different method.
 
 ## Method

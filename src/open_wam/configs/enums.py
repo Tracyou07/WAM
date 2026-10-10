@@ -89,6 +89,13 @@ class ActionMappingMode(StrEnum):
     SPARSE_CANVAS = "sparse_canvas"
 
 
+class CineActionSemantics(StrEnum):
+    """Declared meaning of unchanged Cine joint commands, never a transform."""
+
+    RAW_JOINT_COMMAND = "raw_joint_command"
+    JOINT_DELTA = "joint_delta"
+
+
 class ActionMappingLossMaskMode(StrEnum):
     """How mapped action dimensions contribute to supervised losses."""
 
