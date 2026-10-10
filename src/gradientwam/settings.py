@@ -463,9 +463,10 @@ def load_cine_settings(path: Path) -> CineSettings:
     # Cine's declared sampling default is one window per 32-action group.
     if "sample_stride" not in data_overlay:
         native_raw["data"]["sample_stride"] = 32
-    native_raw["backbone"]["pretrained_model_name_or_path"] = str(frontend_root)
-    native_raw["backbone"]["vae_subdir"] = "vae"
-    native_raw["backbone"]["text_encoder_subdir"] = "text_encoder"
+    # Cine's encoders are separate from the verified OpenWAM runtime checkpoint.
+    native_raw["backbone"]["pretrained_model_name_or_path"] = None
+    native_raw["backbone"]["vae_subdir"] = str(frontend_root / "vae")
+    native_raw["backbone"]["text_encoder_subdir"] = str(frontend_root / "text_encoder")
     native_raw["backbone"]["tokenizer_subdir"] = str(tokenizer_root)
     native_raw["backbone"]["load_wan_vae_frontend"] = False
     native_raw["backbone"]["load_text_conditioning"] = False

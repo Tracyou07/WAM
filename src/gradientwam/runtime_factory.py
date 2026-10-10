@@ -11,6 +11,16 @@ import numpy as np
 import torch
 
 
+def _configure_cagrad_compilation(method_config: Any) -> None:
+    if not method_config.uses_cagrad:
+        return
+    from torch._functorch import config as functorch_config
+
+    # Task gradients reuse the forward graph, so its saved buffers cannot be donated.
+    functorch_config.donated_buffer = False
+    print("[cagrad_compile] donated_buffer=False", flush=True)
+
+
 def build_rank_aware_runtime(
     *,
     settings: Any,
@@ -43,6 +53,7 @@ def build_rank_aware_runtime(
     from .distributed_train import RankAwareTrainingRuntime
 
     try:
+        _configure_cagrad_compilation(settings.method_config)
         seed = int(settings.seed)
         random.seed(seed)
         np.random.seed(seed % (2**32))
