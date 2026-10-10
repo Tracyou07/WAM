@@ -17,6 +17,24 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 
+def test_existing_libero_entry_rejects_non_torchrun_before_model_load(tmp_path, monkeypatch):
+    from gradientwam.distributed_train import _build_runtime
+    from open_wam.training.launch import DistributedLaunchContext, LaunchEnvironment
+
+    split = tmp_path / "episodes.json"
+    split.write_text(json.dumps({"schema_version": 1, "train_episode_ids": [0], "heldout_episode_ids": [1]}))
+    (tmp_path / "settings.yaml").write_text("{}")
+    spec = tmp_path / "run.yaml"
+    spec.write_text("settings_config: settings.yaml\nepisode_split_json: episodes.json\n")
+    monkeypatch.setattr("gradientwam.settings.load_settings", lambda path: SimpleNamespace())
+    monkeypatch.setattr(
+        DistributedLaunchContext, "from_env",
+        classmethod(lambda cls: SimpleNamespace(environment=LaunchEnvironment.SINGLE_PROCESS)),
+    )
+    with pytest.raises(ValueError, match="Launch with torchrun"):
+        _build_runtime(spec, resume=None)
+
+
 class _ToyDataset(Dataset):
     def __init__(self, size: int = 16) -> None:
         self.data_config = SimpleNamespace(split_seed=812)

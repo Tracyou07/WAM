@@ -36,6 +36,7 @@ Repository = "https://github.com/Tracyou07/WAM"
 
 [project.scripts]
 gradientwam = "gradientwam.runner:main"
+gradientwam-cine = "gradientwam.cine_runner:main"
 gradientwam-distributed-train = "gradientwam.distributed_train:main"
 openwam-train = "open_wam.cli.train:main"
 openwam-eval = "open_wam.cli.eval:main"

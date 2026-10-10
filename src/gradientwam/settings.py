@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Any
 from enum import Enum
 import hashlib
 import json
@@ -278,3 +279,246 @@ def load_settings(path: Path) -> Settings:
         episode_id=run['episode_id'], checkpoint=checkpoint, checkpoint_sha256=raw['checkpoint']['sha256'],
         output_root=output, prompt_fingerprint=assets['prompt_encoder_fingerprint'],
         max_minutes=int(run['max_minutes']), native=native, **paths)
+
+@dataclass(frozen=True)
+class CineSettings:
+    """Independent, direct-path settings for the Cine v3 training entry."""
+
+    config_path: Path
+    method_config: GradientWAMMethodConfig
+    seed: int
+    route_seed: int
+    eval_seed: int
+    steps: int
+    checkpoint: Path
+    checkpoint_sha256: str
+    frontend_root: Path
+    tokenizer_root: Path
+    train_root: Path
+    val_root: Path
+    latent_root: Path
+    prompt_cache_root: Path
+    output_root: Path
+    action_semantics: str
+    action_normalization: str
+    native: Any
+    config_sha256: str
+
+    @property
+    def arm(self) -> str:
+        return self.method_config.label
+
+    def native_config(self):
+        return self.native
+
+    def identity(self) -> dict:
+        return {
+            "gradientwam": self.method_config.identity(),
+            "trainability_scope": TRAINABILITY_SCOPE_ID,
+            "seed": self.seed,
+            "route_seed": self.route_seed,
+            "base_sha256": self.checkpoint_sha256,
+            "config_sha256": self.config_sha256,
+            "train_root": str(self.train_root),
+            "validation_root": str(self.val_root),
+            "latent_root": str(self.latent_root),
+            "action_semantics": self.action_semantics,
+            "action_normalization": self.action_normalization,
+            "native_config_sha256": hashlib.sha256(
+                json.dumps(self.native, default=str, sort_keys=True).encode()
+            ).hexdigest(),
+        }
+
+    def validate_fresh_cache_root(self, *, execute: bool = False) -> None:
+        """Refuse to mix a new preparation with an existing cache."""
+        if self.latent_root.exists() and (
+            execute or any(self.latent_root.iterdir())
+        ):
+            raise FileExistsError(
+                f"Cine preparation requires a fresh cache root: {self.latent_root}"
+            )
+
+
+def _merge_config(base: dict, overlay: Mapping) -> dict:
+    merged = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_config(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _assert_write_path_separate(write_path: Path, inputs: tuple[Path, ...], *, label: str) -> None:
+    for input_path in inputs:
+        if (
+            write_path == input_path
+            or write_path in input_path.parents
+            or input_path in write_path.parents
+        ):
+            raise ValueError(f"{label} must not overlap input paths.")
+
+
+def load_cine_settings(path: Path) -> CineSettings:
+    """Load a Cine method config without passing through legacy LIBERO Settings."""
+    from open_wam.configs.enums import ActionNormalizationMode, CineActionSemantics
+    from open_wam.configs.loader import load_experiment_config
+
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    raw = _expand(yaml.safe_load(path.read_text(encoding="utf-8")))
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1 or type(raw.get("schema_version")) is not int:
+        raise ValueError("Cine config requires schema_version: 1.")
+    allowed = {"schema_version", "experiment", "gradientwam", "assets", "data", "preparation", "run"}
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ValueError(f"Unknown Cine config fields: {sorted(unknown)}.")
+    method_config = parse_method_config(raw)
+    if method_config.legacy_v02:
+        raise ValueError("Cine supports only baseline, vrfm, cagrad, and vrfm_cagrad.")
+
+    assets = raw.get("assets")
+    data_overlay = raw.get("data")
+    preparation = raw.get("preparation")
+    run = raw.get("run")
+    if not all(isinstance(value, Mapping) for value in (assets, data_overlay, preparation, run)):
+        raise TypeError("Cine assets, data, preparation, and run sections must be mappings.")
+    required_assets = {"checkpoint", "checkpoint_sha256", "frontend_root", "tokenizer_root"}
+    if set(assets) != required_assets:
+        raise ValueError(f"Cine assets must contain exactly: {sorted(required_assets)}.")
+    required_data = {"dataset_name", "dataset_type", "local_root", "val_local_root", "latent_root"}
+    if not required_data <= set(data_overlay):
+        raise ValueError(f"Cine data is missing fields: {sorted(required_data - set(data_overlay))}.")
+    if data_overlay["dataset_name"] != "cine_v3" or data_overlay["dataset_type"] != "cine_v3_latent":
+        raise ValueError("Cine requires dataset_name=cine_v3 and dataset_type=cine_v3_latent.")
+    if set(preparation) - {"prompt_cache_root"} or "prompt_cache_root" not in preparation:
+        raise ValueError("Cine preparation requires prompt_cache_root and no unknown fields.")
+    if set(run) - {"output_root", "steps", "seed", "route_seed", "eval_seed"}:
+        raise ValueError(f"Unknown Cine run fields: {sorted(set(run) - {'output_root', 'steps', 'seed', 'route_seed', 'eval_seed'})}.")
+    if not {"output_root", "steps", "seed"} <= set(run):
+        raise ValueError("Cine run requires output_root, steps, and seed.")
+    if type(run["steps"]) is not int or run["steps"] <= 0:
+        raise ValueError("run.steps must be a positive integer.")
+    for name in ("seed", "route_seed", "eval_seed"):
+        value = run.get(name, run.get("seed"))
+        if type(value) is not int or value < 0:
+            raise ValueError(f"run.{name} must be a nonnegative integer.")
+
+    checkpoint = _direct_path(assets["checkpoint"])
+    frontend_root = _direct_path(assets["frontend_root"])
+    tokenizer_root = _direct_path(assets["tokenizer_root"])
+    train_root = _direct_path(data_overlay["local_root"])
+    val_root = _direct_path(data_overlay["val_local_root"])
+    latent_root = _direct_path(data_overlay["latent_root"])
+    prompt_cache_root = _direct_path(preparation["prompt_cache_root"])
+    output_root = _direct_path(run["output_root"])
+    if not re.fullmatch(r"[a-f0-9]{64}", str(assets["checkpoint_sha256"])):
+        raise ValueError("assets.checkpoint_sha256 must be a lowercase SHA256 digest.")
+    if prompt_cache_root != latent_root / "prompt_cache":
+        raise ValueError("preparation.prompt_cache_root must be GW_CINE_LATENT_ROOT/prompt_cache.")
+    _assert_write_path_separate(latent_root, (train_root, val_root, checkpoint, frontend_root, tokenizer_root), label="Cine cache root")
+    _assert_write_path_separate(output_root, (latent_root, train_root, val_root, checkpoint, frontend_root, tokenizer_root), label="Cine output root")
+
+    options = data_overlay.get("adapter_options", {})
+    if not isinstance(options, Mapping):
+        raise TypeError("Cine adapter_options must be a mapping.")
+    semantics_enum = CineActionSemantics(options.get("action_semantics", "raw_joint_command"))
+    normalization_enum = ActionNormalizationMode(options.get("action_normalization", "none"))
+    if normalization_enum not in (ActionNormalizationMode.NONE, ActionNormalizationMode.GAUSSIAN):
+        raise ValueError("Cine action normalization supports only none or gaussian.")
+    semantics = semantics_enum.value
+    normalization = normalization_enum.value
+    target = data_overlay.get("action_target", {})
+    if target.get("include_gripper", False) is not False:
+        raise ValueError("Cine requires raw7 joint actions, identity state encoding, and no gripper.")
+    schema = data_overlay.get("action_schema", {})
+    expected_schema = {"action_dim": 7, "action_horizon": 36, "state_dim": 7, "state_horizon": 1}
+    if schema != expected_schema:
+        raise ValueError("Cine action_schema must be raw action7/state7 with action_horizon=36.")
+    if data_overlay.get("num_frames") != 9 or data_overlay.get("frame_stride") != 1:
+        raise ValueError("Cine requires nine latent frames and consecutive source frames.")
+    camera = ("observation.images.color",)
+    if tuple(data_overlay.get("camera_names", ())) != camera or tuple(data_overlay.get("latent_camera_names", ())) != camera:
+        raise ValueError("Cine requires the single observation.images.color camera.")
+
+    experiment_name = raw.get("experiment")
+    if not isinstance(experiment_name, str) or not experiment_name:
+        raise ValueError("Cine experiment must name the native OpenWAM YAML.")
+    experiment_path = (path.parent / experiment_name).resolve()
+    if not experiment_path.is_relative_to(path.parent.resolve()) or not experiment_path.is_file():
+        raise ValueError("Cine experiment must be a YAML file beside the method config.")
+    native_raw = yaml.safe_load(experiment_path.read_text(encoding="utf-8"))
+    if not isinstance(native_raw, dict):
+        raise ValueError("Cine native experiment must be a YAML mapping.")
+    native_raw["data"] = _merge_config(native_raw.get("data", {}), data_overlay)
+    native_raw["data"].update(
+        local_root=str(train_root),
+        val_local_root=str(val_root),
+        latent_root=str(latent_root),
+        split="train",
+        train_fraction=1.0,
+        num_workers=0,
+    )
+    # Cine's declared sampling default is one window per 32-action group.
+    if "sample_stride" not in data_overlay:
+        native_raw["data"]["sample_stride"] = 32
+    native_raw["backbone"]["pretrained_model_name_or_path"] = str(frontend_root)
+    native_raw["backbone"]["vae_subdir"] = "vae"
+    native_raw["backbone"]["text_encoder_subdir"] = "text_encoder"
+    native_raw["backbone"]["tokenizer_subdir"] = str(tokenizer_root)
+    native_raw["backbone"]["load_wan_vae_frontend"] = False
+    native_raw["backbone"]["load_text_conditioning"] = False
+    native_raw["backbone"]["load_reference_core_weights"] = False
+    native_raw["trainer"]["devices"] = 1
+    with tempfile.TemporaryDirectory(prefix="gradientwam-cine-config-") as td:
+        native_path = Path(td) / "experiment.yaml"
+        native_path.write_text(yaml.safe_dump(native_raw, sort_keys=False), encoding="utf-8")
+        native = load_experiment_config(native_path)
+    if (
+        native.data.action_schema.action_dim != 7
+        or native.data.action_schema.action_horizon != 36
+        or native.data.action_schema.state_dim != 7
+        or native.data.num_frames != 9
+        or native.action_decoder.action_dim != 7
+        or native.action_decoder.action_horizon != 36
+        or native.inference.frame_chunk_size != 9
+    ):
+        raise ValueError("Cine method config and native decoder geometry disagree.")
+    if native.data.sample_stride <= 0:
+        raise ValueError("Cine data.sample_stride must be a positive raw-window start stride.")
+    from open_wam.configs.enums import ActionTargetRepresentation, ActionTargetStateEncoding
+    if (
+        native.data.action_target.representation is not ActionTargetRepresentation.RAW
+        or native.data.action_target.state_encoding is not ActionTargetStateEncoding.IDENTITY
+        or native.data.action_target.include_gripper
+    ):
+        raise ValueError("Cine native config requires raw joint actions, identity state, and no gripper.")
+    identity_raw = dict(raw)
+    identity_raw["run"] = dict(run)
+    identity_raw["run"].pop("steps", None)
+    identity_raw["run"].pop("output_root", None)
+    config_digest = hashlib.sha256(
+        json.dumps(identity_raw, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+    return CineSettings(
+        config_path=path,
+        method_config=method_config,
+        seed=run["seed"],
+        route_seed=run.get("route_seed", run["seed"]),
+        eval_seed=run.get("eval_seed", run["seed"]),
+        steps=run["steps"],
+        checkpoint=checkpoint,
+        checkpoint_sha256=str(assets["checkpoint_sha256"]),
+        frontend_root=frontend_root,
+        tokenizer_root=tokenizer_root,
+        train_root=train_root,
+        val_root=val_root,
+        latent_root=latent_root,
+        prompt_cache_root=prompt_cache_root,
+        output_root=output_root,
+        action_semantics=semantics,
+        action_normalization=normalization,
+        native=native,
+        config_sha256=config_digest,
+    )
