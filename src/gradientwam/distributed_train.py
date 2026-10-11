@@ -813,8 +813,8 @@ class RankAwareTrainingRuntime:
             self.strategy.close()
 
     def _evaluate_heldout(self) -> dict[str, Any] | None:
-        if not self.strategy.is_main_process:
-            return None
+        # Every rank uses the complete ordered validation loader so native
+        # forward collectives pair; only rank zero accumulates the metrics.
         model = self.strategy.unwrap_model(self.model)
         was_training = bool(model.training)
         previous_pipeline = self.step_executor.pipeline
@@ -836,10 +836,14 @@ class RankAwareTrainingRuntime:
                     )
                     with self.strategy.autocast_context():
                         result = self.step_executor.forward_train(device_batch)
+                    if not self.strategy.is_main_process:
+                        continue
                     action_proxy, world_proxy, count = _heldout_batch_proxies(result)
                     action_total += float(action_proxy.cpu()) * count
                     world_total += float(world_proxy.cpu()) * count
                     sample_total += count
+            if not self.strategy.is_main_process:
+                return None
             if sample_total <= 0:
                 raise ValueError("heldout evaluation produced no samples")
             return {
