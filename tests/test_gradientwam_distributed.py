@@ -86,6 +86,48 @@ class _ToyStepExecutor:
         return SimpleNamespace(loss=loss, metrics={"toy_loss": loss.detach()})
 
 
+class _NativeCAGradStepExecutor(_ToyStepExecutor):
+    """Real native video/action losses, posterior sampling and state conditioning."""
+
+    def forward_train(self, batch):
+        from open_wam.models.policy_variants.contracts import PolicyTrainBatch
+
+        observations, targets = batch
+        noise = torch.rand_like(targets) * .01
+        self.batch_log.append((observations.flatten().tolist(), (targets + noise).flatten().tolist()))
+        scalar = (targets + noise).reshape(-1, 1, 1, 1, 1)
+        latents = scalar.expand(-1, 48, 4, 4, 4).contiguous()
+        condition = observations.reshape(-1, 1, 1, 1, 1).expand(-1, 48, 1, 4, 4).contiguous()
+        actions = (targets + noise).reshape(-1, 1, 1).expand(-1, 4, 4).contiguous()
+        state = observations.expand(-1, 4).contiguous()
+        native_batch = PolicyTrainBatch(actions=actions, state=state, extra={
+            'condition_latents': condition,
+            'proprio_context_frames': state[:, None].expand(-1, 4, -1).contiguous(),
+            'proprio_context_frames_mask': torch.ones_like(actions),
+        })
+        text = observations.reshape(-1, 1, 1).expand(-1, 3, 16).contiguous()
+        result = self.pipeline.forward_train_from_latents(latents, native_batch, text_context=text)
+        decoder = result.decoder_output
+        return SimpleNamespace(loss=decoder.loss, metrics=decoder.metrics,
+                               task_losses=decoder.aux['task_losses'],
+                               task_active={'video': True, 'action': True})
+
+
+def _assert_nested_equal(expected, actual):
+    if isinstance(expected, torch.Tensor):
+        assert torch.equal(expected, actual)
+    elif isinstance(expected, dict):
+        assert expected.keys() == actual.keys()
+        for key in expected:
+            _assert_nested_equal(expected[key], actual[key])
+    elif isinstance(expected, (list, tuple)):
+        assert len(expected) == len(actual)
+        for left, right in zip(expected, actual, strict=True):
+            _assert_nested_equal(left, right)
+    else:
+        assert expected == actual
+
+
 class _LogSink:
     def log_event(self, **_kwargs) -> None:
         pass
@@ -103,7 +145,7 @@ def _free_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _worker(rank: int, world_size: int, port: int, root: str) -> None:
+def _worker(rank: int, world_size: int, port: int, root: str, actual_native: bool = False) -> None:
     os.environ.update(
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
@@ -165,10 +207,31 @@ def _worker(rank: int, world_size: int, port: int, root: str) -> None:
         "gradient_accumulation_steps": 2,
         "global_batch_size": world_size * 2,
     }
+    if actual_native:
+        identity.update(method='vrfm_cagrad', trainability_scope='native_action_final_video_kv_hidden_proprio_v2')
+    total_steps = 3 if actual_native else 2
 
     def make_runtime(init_seed: int):
         torch.manual_seed(init_seed)
-        model = strategy.prepare_model(_TinyPolicy())
+        method_config = None
+        cagrad_candidates = ()
+        trainability_audit = {}
+        plain = _TinyPolicy()
+        if actual_native:
+            from tests.test_variational_native_pipeline import fixture
+            from gradientwam.cagrad_training import configure_native_trainability, cagrad_candidate_parameters
+            from gradientwam.settings import GradientWAMMethodConfig, GradientWAMMethod
+            from open_wam.models.policy_variants.dual_expert.vrfm import configure_vrfm
+
+            plain, *_ = fixture()
+            trainability_audit = configure_native_trainability(
+                plain, expected_layers=2, train_proprio_projection=True,
+            )
+            configure_vrfm(plain, latent_dim=4, kl_weight=.01)
+            method_config = GradientWAMMethodConfig(method=GradientWAMMethod.VRFM_CAGRAD,
+                latent_dim=4, kl_weight=.01, train_proprio_projection=True)
+            cagrad_candidates = cagrad_candidate_parameters(plain)
+        model = strategy.prepare_model(plain)
         dataset = EpisodeSubset(_ToyDataset(), list(range(16)), seed=441)
         native_sampler = LocalLatentWeightedTrainSampler(
             dataset, world_size=world_size, rank=rank
@@ -177,7 +240,7 @@ def _worker(rank: int, world_size: int, port: int, root: str) -> None:
         loader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0)
         config = ExperimentConfig(
             training=TrainingConfig(
-                gradient_accumulation_steps=2, max_grad_norm=None, num_steps=2
+                gradient_accumulation_steps=2, max_grad_norm=None, num_steps=total_steps
             ),
             trainer=TrainerConfig(
                 accelerator=TrainerAccelerator.CPU,
@@ -212,7 +275,7 @@ def _worker(rank: int, world_size: int, port: int, root: str) -> None:
             strategy=strategy,
             train_loader=loader,
             val_loader=DataLoader(_ToyDataset(2), batch_size=1),
-            step_executor=_ToyStepExecutor(model),
+            step_executor=(_NativeCAGradStepExecutor(model) if actual_native else _ToyStepExecutor(model)),
             optimizer=optimizer,
             scheduler=scheduler,
             checkpoint_manager=manager,
@@ -225,6 +288,9 @@ def _worker(rank: int, world_size: int, port: int, root: str) -> None:
             output_dir=output_dir,
             eval_seed=7,
             identity=identity,
+            method_config=method_config,
+            cagrad_candidates=cagrad_candidates,
+            trainability_audit=trainability_audit,
         )
         return runtime, adapter
 
@@ -234,7 +300,7 @@ def _worker(rank: int, world_size: int, port: int, root: str) -> None:
         for name, value in strategy.unwrap_model(live.model).state_dict().items()
     }
     live._run_step_loop(
-        StepLoopPolicy(max_steps=2, limit_train_batches=None, limit_val_batches=0)
+        StepLoopPolicy(max_steps=total_steps, limit_train_batches=None, limit_val_batches=0)
     )
     checkpoint_step1 = checkpoint_root / "checkpoint_step_1"
     checkpoint_payload = torch.load(
@@ -247,7 +313,7 @@ def _worker(rank: int, world_size: int, port: int, root: str) -> None:
         None
     ] * world_size
     dist.all_gather_object(per_rank_batches, live_runtime.step_executor.batch_log[:2])
-    if rank == 0:
+    if rank == 0 and not actual_native:
         observations = torch.tensor(
             [item[0][0] for rank_batches in per_rank_batches for item in rank_batches],
             dtype=torch.float32,
@@ -280,8 +346,18 @@ def _worker(rank: int, world_size: int, port: int, root: str) -> None:
     if resumed.train_loader.sampler.resume_batch_index != 2:
         raise AssertionError("rank wrapper did not restore the mid-epoch sampler cursor")
     resumed._run_step_loop(
-        StepLoopPolicy(max_steps=2, limit_train_batches=None, limit_val_batches=0)
+        StepLoopPolicy(max_steps=total_steps, limit_train_batches=None, limit_val_batches=0)
     )
+
+    _assert_nested_equal(live.optimizer.state_dict(), resumed.optimizer.state_dict())
+    _assert_nested_equal(live.scheduler.state_dict(), resumed.scheduler.state_dict())
+    assert live.train_state.optimizer_step == resumed.train_state.optimizer_step == total_steps
+    assert live_runtime.step_executor.batch_log[2:] == resumed_runtime.step_executor.batch_log
+    if actual_native:
+        rejected_runtime, rejected = make_runtime(1400 + rank)
+        rejected.identity = {**identity, 'trainability_scope': 'changed_scope'}
+        with pytest.raises(ValueError, match='identity'):
+            rejected.resume(str(checkpoint_step1))
 
     expected_parameters = [
         value.detach().clone() for value in strategy.unwrap_model(live.model).parameters()
@@ -310,11 +386,13 @@ def _worker(rank: int, world_size: int, port: int, root: str) -> None:
                 {
                     "world_size": world_size,
                     "gradient_accumulation_steps": 2,
-                    "global_batch_reference_matches": True,
+                    "global_batch_reference_matches": not actual_native,
                     "per_rank_data_and_noise_differ": True,
                     "runtime_cursor_restored": True,
                     "rank_rng_and_sampler_state_restored": True,
                     "resumed_update_matches_uninterrupted": True,
+                    "optimizer_and_scheduler_match": True,
+                    "native_vrfm_cagrad": actual_native,
                 },
                 indent=2,
             )
@@ -334,6 +412,15 @@ def test_two_rank_gloo_runtime_training_sampling_and_resume(tmp_path: Path) -> N
     assert result["global_batch_reference_matches"] is True
     assert result["per_rank_data_and_noise_differ"] is True
     assert result["runtime_cursor_restored"] is True
+
+
+@pytest.mark.skipif(not dist.is_gloo_available(), reason='Gloo backend is unavailable')
+def test_three_rank_native_vrfm_cagrad_resume_restores_full_update(tmp_path: Path) -> None:
+    mp.spawn(_worker, args=(3, _free_port(), str(tmp_path), True), nprocs=3, join=True)
+    result = json.loads((tmp_path / 'result.json').read_text())
+    assert result['native_vrfm_cagrad']
+    assert result['resumed_update_matches_uninterrupted']
+    assert result['optimizer_and_scheduler_match']
     assert result["rank_rng_and_sampler_state_restored"] is True
     assert result["resumed_update_matches_uninterrupted"] is True
 
