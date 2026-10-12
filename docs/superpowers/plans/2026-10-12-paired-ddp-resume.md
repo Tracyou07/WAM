@@ -71,5 +71,10 @@ if the real continuation regression exposes a defect.
 ### Task 4: Review and remote delivery
 
 - [x] Review the entire branch against the latest table and resume requirement.
-- [ ] Publish the branch/PR, attach it to this chat, and verify remote commit.
-- [ ] Report checks performed and full-width CUDA/benchmark limits precisely.
+- [x] Publish the branch/PR, attach it to this chat, and verify remote commit.
+- [x] Report checks performed and full-width CUDA/benchmark limits precisely.
+
+Delivery: https://github.com/Tracyou07/WAM/pull/3 (open against main).
+Full-state continuation was verified with the actual native tiny VRFM+CAGrad
+pipeline under three-rank CPU/Gloo. Broader inherited failures and the baseline
+video-encoding stall are documented in `docs/paired_comparison.md` and the PR.
