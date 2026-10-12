@@ -2,7 +2,7 @@
 
 OpenWAM is the backbone. A continuous variational latent conditions both video and action prediction; CAGrad coordinates their gradients on common generator parameters. The new method has **no additional private K/V path, routing gate, or policy expert**.
 
-本项目用变分潜变量区分可能的未来，用 CAGrad 协调视频与动作联合学习。提供 baseline、仅 VRFM、仅 CAGrad、VRFM+CAGrad 四组配置，以及数据准备、1/2/8 卡训练、独立留出验证和断点恢复入口。
+本项目用变分潜变量区分可能的未来，用 CAGrad 协调视频与动作联合学习。主要比较本项目 baseline 与 VRFM+CAGrad；另提供仅 VRFM、仅 CAGrad 配置用于拆分贡献。LIBERO 和 RM75/Cine 两个入口共用 DDP、受限基础参数范围及完整状态断点恢复。当前示例都只跑 2 次更新，10000 步需在实际运行配置中显式设置。见[配对对照协议](docs/paired_comparison.md)。
 
 **RM75/Cine LeRobot v3 数据请使用独立入口 `gradientwam-cine`：** 支持单 `color` 相机、30 FPS、7 维位置/四元数状态与原始 7 维关节命令。配置位于 `configs/cine_v3/`；完整命令见 [Cine v3 使用说明](docs/cine_v3.md)。下文的 `gradientwam` 命令继续用于原 LIBERO 数据，两个入口共用模型与训练算法。
 
@@ -103,7 +103,7 @@ Select only free devices on your own machine. `NPROC_PER_NODE=1` or `2` uses few
 
 The native recipe uses batch size 1 per rank and 10 accumulated microbatches, yielding global batch 10/20/80 at 1/2/8 ranks. Keep the same topology across method comparisons. DDP replicates the model on each device; eight GPUs do not pool their memory. CAGrad requires separate task-gradient storage and extra differentiation; its resource cost must be measured on the full model.
 
-All four arms train the native action expert/packed action blocks and only the last video block's self-attention K/V. Other video parameters stay frozen; VRFM arms also train the posterior and latent projections. This bounded training scope adds no private route and is checked on resume. It is not full video-backbone fine-tuning.
+All four shipped arms train the native action expert/packed action blocks, the last video block's self-attention K/V, and the native hidden proprioceptive-state projection (`train_proprio_projection: true`). Other video parameters stay frozen; VRFM arms also train the posterior and latent projections with isolated initialization. This is the project's bounded OpenWAM baseline, not the upstream full-video-backbone training scope. Both entries use DDP; the current CAGrad path does not support FSDP. The scope is checked on resume. Old checkpoints retain their original configuration and scope; do not resume them with a newly enabled state projection.
 
 For explicit configuration, copy [gradientwam_distributed.example.yaml](configs/gradientwam_distributed.example.yaml) and set your settings file, split and total update budget:
 

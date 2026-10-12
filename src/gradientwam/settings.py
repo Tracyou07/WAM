@@ -25,6 +25,7 @@ class GradientWAMMethod(str, Enum):
 
 ARMS = tuple(method.value for method in GradientWAMMethod)
 TRAINABILITY_SCOPE_ID = 'native_action_plus_final_video_shared_kv_v1'
+PROPRIO_TRAINABILITY_SCOPE_ID = 'native_action_final_video_kv_hidden_proprio_v2'
 LEGACY_ARMS = (
     'native_joint',
     'same_capacity_deterministic_kv_blend',
@@ -42,8 +43,13 @@ class GradientWAMMethodConfig:
     cagrad_c: float = 0.4
     legacy_v02: bool = False
     legacy_arm: str | None = None
+    train_proprio_projection: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.train_proprio_projection) is not bool:
+            raise TypeError('gradientwam.train_proprio_projection must be a boolean.')
+        if self.legacy_v02 and self.train_proprio_projection:
+            raise ValueError('Legacy scope cannot enable the new hidden proprio projection.')
         if self.legacy_v02:
             if self.method is not None or self.legacy_arm not in LEGACY_ARMS:
                 raise ValueError('legacy_v02 requires exactly one supported legacy arm.')
@@ -77,16 +83,25 @@ class GradientWAMMethodConfig:
     def label(self) -> str:
         return self.legacy_arm if self.legacy_v02 else self.method.value
 
+    @property
+    def trainability_scope(self) -> str:
+        if self.legacy_v02:
+            return 'legacy_v02'
+        return PROPRIO_TRAINABILITY_SCOPE_ID if self.train_proprio_projection else TRAINABILITY_SCOPE_ID
+
     def identity(self) -> dict:
         if self.legacy_v02:
             return {'method': 'legacy_v02', 'arm': self.legacy_arm, 'legacy_v02': True}
-        return {
+        identity = {
             'method': self.method.value,
             'latent_dim': self.latent_dim,
             'kl_weight': self.kl_weight,
             'cagrad_c': self.cagrad_c,
             'legacy_v02': False,
         }
+        if self.train_proprio_projection:
+            identity['train_proprio_projection'] = True
+        return identity
 
 
 def parse_method_config(raw: Mapping) -> GradientWAMMethodConfig:
@@ -111,7 +126,7 @@ def parse_method_config(raw: Mapping) -> GradientWAMMethodConfig:
     values = raw.get('gradientwam', {})
     if not isinstance(values, Mapping):
         raise TypeError('gradientwam must be a mapping.')
-    unknown = set(values) - {'method', 'latent_dim', 'kl_weight', 'cagrad_c'}
+    unknown = set(values) - {'method', 'latent_dim', 'kl_weight', 'cagrad_c', 'train_proprio_projection'}
     if unknown:
         raise ValueError(f'Unknown gradientwam settings: {sorted(unknown)}.')
     try:
@@ -124,6 +139,7 @@ def parse_method_config(raw: Mapping) -> GradientWAMMethodConfig:
         latent_dim=values.get('latent_dim', 32),
         kl_weight=values.get('kl_weight', 0.001),
         cagrad_c=values.get('cagrad_c', 0.4),
+        train_proprio_projection=values.get('train_proprio_projection', False),
     )
 
 
@@ -206,7 +222,7 @@ class Settings:
         return self.method_config.label
 
     def identity(self) -> dict:
-        scope = 'legacy_v02' if self.method_config.legacy_v02 else TRAINABILITY_SCOPE_ID
+        scope = self.method_config.trainability_scope
         return {'gradientwam': self.method_config.identity(), 'trainability_scope': scope,
                 'seed': self.seed, 'route_seed': self.route_seed,
                 'episode_id': self.episode_id, 'base_sha256': self.checkpoint_sha256,
@@ -314,7 +330,7 @@ class CineSettings:
     def identity(self) -> dict:
         return {
             "gradientwam": self.method_config.identity(),
-            "trainability_scope": TRAINABILITY_SCOPE_ID,
+            "trainability_scope": self.method_config.trainability_scope,
             "seed": self.seed,
             "route_seed": self.route_seed,
             "base_sha256": self.checkpoint_sha256,

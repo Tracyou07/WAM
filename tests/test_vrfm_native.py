@@ -37,6 +37,19 @@ def test_baseline_task_losses_keep_graph_without_new_parameters():
     assert before == {n: id(p) for n, p in pipeline.named_parameters()}
 
 
+def test_vrfm_attachment_preserves_native_values_and_rng_stream():
+    pipeline, *_ = fixture()
+    before = {name: parameter.detach().clone()
+              for name, parameter in pipeline.named_parameters()}
+    torch.manual_seed(12012)
+    rng_before = torch.get_rng_state().clone()
+    extension().configure_vrfm(pipeline, latent_dim=4)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    for name, parameter in pipeline.named_parameters():
+        if name in before:
+            torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
+
+
 def test_native_vrfm_both_streams_reach_posterior_and_kl():
     pipeline, batch, latent, text = fixture()
     next(pipeline.visual_tower.core.parameters()).requires_grad_(False)

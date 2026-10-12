@@ -80,3 +80,22 @@ def test_legacy_marker_cannot_be_combined_with_new_method() -> None:
                 "gradientwam": {"method": "baseline"},
             }
         )
+
+
+def test_state_projection_scope_is_explicit_and_checkpoint_identified() -> None:
+    original = parse_method_config({'gradientwam': {'method': 'baseline'}})
+    enabled = parse_method_config({'gradientwam': {
+        'method': 'baseline', 'train_proprio_projection': True,
+    }})
+    assert original.identity() == {
+        'method': 'baseline', 'latent_dim': 32, 'kl_weight': .001,
+        'cagrad_c': .4, 'legacy_v02': False,
+    }
+    assert enabled.identity()['train_proprio_projection'] is True
+    assert enabled.trainability_scope != original.trainability_scope
+
+
+@pytest.mark.parametrize('value', ['true', 1, None])
+def test_state_projection_scope_rejects_non_boolean_values(value) -> None:
+    with pytest.raises(TypeError, match='train_proprio_projection'):
+        parse_method_config({'gradientwam': {'train_proprio_projection': value}})
