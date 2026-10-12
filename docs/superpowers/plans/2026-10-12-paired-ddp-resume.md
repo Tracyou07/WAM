@@ -34,13 +34,13 @@ Keep old settings identities unchanged when the new scope is disabled.
 dual_expert/vrfm.py, tests/test_gradientwam_training_methods.py,
 tests/test_gradientwam_vrfm_cagrad_settings.py, tests/test_vrfm.py.
 
-- [ ] Add tests for opt-in scope identity, real projection gradients/updates,
+- [x] Add tests for opt-in scope identity, real projection gradients/updates,
   ordinary single-task handling, and independent VRFM initialization.
-- [ ] Run focused tests and observe the missing-feature failures.
-- [ ] Add validated `train_proprio_projection` with an old-scope-compatible default;
+- [x] Run focused tests and observe the missing-feature failures.
+- [x] Add validated `train_proprio_projection` with an old-scope-compatible default;
   propagate it through both shared and single-device construction paths.
-- [ ] Preserve the native RNG while attaching VRFM; test both arms' base values.
-- [ ] Run the focused suite and commit the implementation with its tests.
+- [x] Preserve the native RNG while attaching VRFM; test both arms' base values.
+- [x] Run the focused suite and commit the implementation with its tests.
 
 ### Task 2: Paired entry recipes and accurate documentation
 
@@ -48,28 +48,28 @@ tests/test_gradientwam_vrfm_cagrad_settings.py, tests/test_vrfm.py.
 configs/cine_v3/{baseline,vrfm,cagrad,vrfm_cagrad}.yaml, README.md,
 docs/vrfm_cagrad.md, docs/cine_v3.md, tests/test_gradientwam_paired_recipes.py.
 
-- [ ] Test resolved arm equality apart from method, scope activation, and actual
+- [x] Test resolved arm equality apart from method, scope activation, and actual
   two-update entry budgets for both entries.
-- [ ] Observe failing scope activation before changing shipped recipes.
-- [ ] Enable state-projection training equally and document the approved table,
+- [x] Observe failing scope activation before changing shipped recipes.
+- [x] Enable state-projection training equally and document the approved table,
   actual global-batch calculation, explicit budget changes and legacy resume.
-- [ ] Run config and entry tests and commit.
+- [x] Run config and entry tests and commit.
 
 ### Task 3: VRFM+CAGrad DDP continuation regression
 
 **Files:** tests/test_gradientwam_distributed.py; checkpoint/runtime files only
 if the real continuation regression exposes a defect.
 
-- [ ] Add a small real two-task posterior/projection model to the existing Gloo
+- [x] Add a small real two-task posterior/projection model to the existing Gloo
   runtime test; stop at optimizer step one and resume through further updates.
-- [ ] Compare next batches/noise, all model values, optimizer state, scheduler,
+- [x] Compare next batches/noise, all model values, optimizer state, scheduler,
   step/cursor state, and cross-rank agreement with uninterrupted training.
-- [ ] Exercise matching-scope continuation and changed-scope rejection.
-- [ ] Fix any evidenced defect at the shared owner, with a failing regression.
-- [ ] Run scoped regressions, then the relevant broader suite and commit.
+- [x] Exercise matching-scope continuation and changed-scope rejection.
+- [x] Check for a shared checkpoint defect; no checkpoint change was required.
+- [x] Run scoped regressions, then the relevant broader suite and commit.
 
 ### Task 4: Review and remote delivery
 
-- [ ] Review the entire branch against the latest table and resume requirement.
+- [x] Review the entire branch against the latest table and resume requirement.
 - [ ] Publish the branch/PR, attach it to this chat, and verify remote commit.
 - [ ] Report checks performed and full-width CUDA/benchmark limits precisely.

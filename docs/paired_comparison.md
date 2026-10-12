@@ -69,3 +69,12 @@ batches/noise and rank agreement. A changed-scope identity was rejected.
 These tests use synthetic inputs and a two-layer native fixture. They validate
 the update/recovery path, not full-width H20 memory fit, CUDA bitwise behavior,
 LIBERO success or performance on private robot data.
+
+The broader upstream suite is not green on this derivative repository. In two
+CPU batches it recorded 1887 passes before a video-encoding stall and 1685 passes
+from that module onward, with overlap at the module boundary. All 25 failed
+checks were reproduced on unchanged main `8463cfd`, as was the full-suite
+video-encoding stall. They concern upstream docs/release/package assumptions,
+audit metadata and a shell-script permission check. The PyPI test module was
+excluded because its referenced publishing workflow is not shipped. No broad
+regression unique to this branch was found in these checks.
