@@ -2,6 +2,12 @@
 
 `gradientwam-cine` targets the RM75/Cine LeRobot v3 dataset. The existing `gradientwam` LIBERO commands and configurations remain available. Both entries share OpenWAM, the four method choices, CAGrad gradient coordination and the native training runtime.
 
+The shipped methods use the same bounded DDP base scope, including the native
+state projection. Their `run.steps: 2` is the actual smoke budget; a formal
+10000-update comparison requires explicitly setting both runs to that budget.
+Keep the original settings when resuming older checkpoints with frozen state
+projection. See [paired comparison and resume](paired_comparison.md).
+
 ## Data meaning
 
 Use one explicitly selected training root and a separate validation root. The example scale directories are `train_0.6k`, `train_1.2k`, `train_2.4k`, `train_4.8k`, `train_9.6k`, and `train_all`; these may overlap and must not be concatenated as disjoint examples. The validation directory is `validation_200`.
