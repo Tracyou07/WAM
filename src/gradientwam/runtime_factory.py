@@ -94,15 +94,15 @@ def build_rank_aware_runtime(
             )
         else:
             from .cagrad_training import (
-                TRAINABILITY_SCOPE_ID,
                 cagrad_candidate_parameters,
                 configure_native_trainability,
             )
 
             trainability_audit = configure_native_trainability(
-                model, expected_layers=int(config.backbone.num_layers)
+                model, expected_layers=int(config.backbone.num_layers),
+                train_proprio_projection=settings.method_config.train_proprio_projection,
             )
-            if trainability_audit["scope_id"] != TRAINABILITY_SCOPE_ID:
+            if trainability_audit["scope_id"] != settings.method_config.trainability_scope:
                 raise ValueError("Unexpected GradientWAM trainability scope")
             if settings.method_config.uses_vrfm:
                 from open_wam.models.policy_variants.dual_expert.vrfm import configure_vrfm

@@ -86,6 +86,62 @@ def test_native_profile_is_explicit_and_bounded():
     }
 
 
+def test_state_projection_updates_without_unfreezing_other_video_parameters():
+    pipeline = _profile_fixture()
+    core = nn.Module()
+    core.blocks = nn.ModuleList()
+    core.proprio_hidden_context_encoder = nn.Module()
+    core.proprio_hidden_context_encoder.proj = nn.Linear(2, 2)
+    pipeline.visual_tower.core = core
+    projection = core.proprio_hidden_context_encoder.proj
+    report = configure_native_trainability(
+        pipeline, expected_layers=2, train_proprio_projection=True,
+    )
+    candidates = cagrad_candidate_parameters(pipeline)
+    assert {id(p) for p in projection.parameters()} <= {id(p) for p in candidates}
+    assert report['hidden_proprio_parameter_count'] == 6
+    frozen_before = pipeline.policy_variant.v0.weight.detach().clone()
+    projection_before = projection.weight.detach().clone()
+    optimizer = torch.optim.SGD(
+        [p for p in pipeline.parameters() if p.requires_grad], lr=.1,
+    )
+    features = projection(torch.tensor([[1., 2.]]))
+    losses = {
+        'video': pipeline.policy_variant.v1.attn1.to_k(features).square().sum(),
+        'action': pipeline.policy_variant.action_expert(features).square().sum(),
+    }
+    accumulator = CAGradGradientAccumulator(candidates, c=.4)
+    accumulator.accumulate(losses, {'video': True, 'action': True}, scale=1.)
+    sum(losses.values()).backward()
+    result = accumulator.finalize(pipeline.parameters())
+    assert result['common_parameter_count'] == 2
+    optimizer.step()
+    assert not torch.equal(projection.weight, projection_before)
+    assert torch.equal(pipeline.policy_variant.v0.weight, frozen_before)
+
+
+def test_projection_used_by_one_task_keeps_ordinary_gradient():
+    pipeline = _profile_fixture()
+    core = nn.Module()
+    core.blocks = nn.ModuleList()
+    core.proprio_hidden_context_encoder = nn.Module()
+    core.proprio_hidden_context_encoder.proj = nn.Linear(2, 2)
+    pipeline.visual_tower.core = core
+    configure_native_trainability(pipeline, expected_layers=2,
+                                  train_proprio_projection=True)
+    projection = core.proprio_hidden_context_encoder.proj
+    losses = {
+        'video': pipeline.policy_variant.v1.attn1.to_k(torch.ones(1, 2)).sum(),
+        'action': projection(torch.tensor([[2., 3.]])).sum(),
+    }
+    accumulator = CAGradGradientAccumulator(cagrad_candidate_parameters(pipeline), c=.4)
+    accumulator.accumulate(losses, {'video': True, 'action': True}, scale=1.)
+    sum(losses.values()).backward()
+    report = accumulator.finalize(pipeline.parameters())
+    assert report['common_parameter_count'] == 0
+    torch.testing.assert_close(projection.weight.grad, torch.tensor([[2., 3.], [2., 3.]]))
+
+
 def _activity_leaf(action_mask, video_mask):
     return SimpleNamespace(
         policy_output=SimpleNamespace(

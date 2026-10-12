@@ -117,13 +117,16 @@ def configure_vrfm(pipeline, latent_dim: int = 32, kl_weight: float = .001) -> d
         raise ValueError('VRFM cannot be combined with legacy private K/V sharing')
     previous = {id(p): p.requires_grad for p in pipeline.parameters()}
     reference = next(policy.action_expert.parameters())
-    policy.vrfm = VariationalFlowConditioning(
-        video_channels=pipeline.visual_tower.config.latent_channels,
-        action_dim=policy.action_dim, text_dim=pipeline.visual_tower.config.text_dim,
-        video_hidden_size=pipeline.visual_tower.config.hidden_size,
-        action_hidden_size=policy.action_expert.hidden_size,
-        latent_dim=latent_dim, kl_weight=float(kl_weight),
-    ).to(device=reference.device, dtype=reference.dtype)
+    devices = [] if reference.device.type != 'cuda' else [reference.device]
+    # Extra-module initialization must not consume the native model's RNG stream.
+    with torch.random.fork_rng(devices=devices):
+        policy.vrfm = VariationalFlowConditioning(
+            video_channels=pipeline.visual_tower.config.latent_channels,
+            action_dim=policy.action_dim, text_dim=pipeline.visual_tower.config.text_dim,
+            video_hidden_size=pipeline.visual_tower.config.hidden_size,
+            action_hidden_size=policy.action_expert.hidden_size,
+            latent_dim=latent_dim, kl_weight=float(kl_weight),
+        ).to(device=reference.device, dtype=reference.dtype)
     policy.vrfm.train(policy.training)
     return {
         'latent_dim': latent_dim, 'kl_weight': float(kl_weight), 'prior': 'N(0,I)',

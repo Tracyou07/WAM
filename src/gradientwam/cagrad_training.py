@@ -11,13 +11,13 @@ from torch import nn
 from open_wam.configs.enums import CurrentBlockCoupling, HistoryStreamVisibility
 
 from .cagrad import cagrad_coefficients
-from .settings import TRAINABILITY_SCOPE_ID
+from .settings import TRAINABILITY_SCOPE_ID, PROPRIO_TRAINABILITY_SCOPE_ID
 _GRADIENT_BUCKET_ELEMENTS = 4_000_000
 _DOT_CHUNK_ELEMENTS = 1_000_000
 
 
 def configure_native_trainability(
-    pipeline: nn.Module, *, expected_layers: int
+    pipeline: nn.Module, *, expected_layers: int, train_proprio_projection: bool = False
 ) -> dict[str, Any]:
     """Apply the shared, bounded native scope used by all four new methods."""
     policy = pipeline.policy_variant
@@ -49,6 +49,13 @@ def configure_native_trainability(
         if not training_config.objective_enabled(objective) or training_config.objective_weight(objective) != 1.0:
             raise ValueError("The bounded scope requires unit-weight action and video objectives")
 
+    if type(train_proprio_projection) is not bool:
+        raise TypeError('train_proprio_projection must be a boolean')
+    encoder = getattr(pipeline.visual_tower.core, 'proprio_hidden_context_encoder', None)
+    if train_proprio_projection and (
+        encoder is None or not isinstance(getattr(encoder, 'proj', None), nn.Linear)
+    ):
+        raise ValueError('The proprio scope requires the native hidden proprio projection')
     pipeline.requires_grad_(False)
     policy.action_expert.requires_grad_(True)
     for pair in stack.packed_blocks:
@@ -56,6 +63,10 @@ def configure_native_trainability(
     final_video = stack.packed_blocks[-1].video_block
     final_video.attn1.to_k.requires_grad_(True)
     final_video.attn1.to_v.requires_grad_(True)
+    proprio_parameters = ()
+    if train_proprio_projection:
+        encoder.proj.requires_grad_(True)
+        proprio_parameters = tuple(encoder.proj.parameters())
 
     trainable = [
         (name, parameter)
@@ -76,12 +87,12 @@ def configure_native_trainability(
         for module in (final_video.attn1.to_k, final_video.attn1.to_v)
         for parameter in module.parameters()
     }
-    if video_ids != expected_video_ids or any(
-        parameter.requires_grad for parameter in pipeline.visual_tower.parameters()
-    ):
-        raise ValueError("Trainable video parameters must be only final-block shared K/V")
+    tower_ids = {id(p) for p in pipeline.visual_tower.parameters() if p.requires_grad}
+    if video_ids != expected_video_ids or tower_ids != {id(p) for p in proprio_parameters}:
+        raise ValueError("Trainable video parameters must be final K/V and the selected state projection")
     return {
-        "scope_id": TRAINABILITY_SCOPE_ID,
+        "scope_id": PROPRIO_TRAINABILITY_SCOPE_ID if train_proprio_projection else TRAINABILITY_SCOPE_ID,
+        "hidden_proprio_parameter_count": sum(p.numel() for p in proprio_parameters),
         "trainable_parameter_count": sum(parameter.numel() for _, parameter in trainable),
         "trainable_parameters": {name: parameter.numel() for name, parameter in trainable},
         "video_shared_kv_parameter_count": sum(
@@ -102,6 +113,9 @@ def cagrad_candidate_parameters(pipeline: nn.Module) -> tuple[nn.Parameter, ...]
     # while video queries cannot read action keys. The action-side projection
     # and action expert therefore stay outside the bounded common candidate set.
     modules = [final_video.attn1.to_k, final_video.attn1.to_v]
+    encoder = getattr(pipeline.visual_tower.core, 'proprio_hidden_context_encoder', None)
+    if encoder is not None:
+        modules.append(encoder.proj)
     vrfm = getattr(policy, "vrfm", None)
     if vrfm is not None:
         modules.append(vrfm.video_projection)

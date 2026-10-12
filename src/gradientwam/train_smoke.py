@@ -226,7 +226,8 @@ def _build_stack(config, *, base_checkpoint: Path, load_public_base: bool,
     else:
         from .cagrad_training import cagrad_candidate_parameters, configure_native_trainability
         sharing_audit = configure_native_trainability(
-            pipeline, expected_layers=int(config.backbone.num_layers)
+            pipeline, expected_layers=int(config.backbone.num_layers),
+            train_proprio_projection=method_config.train_proprio_projection,
         )
         if method_config.uses_vrfm:
             from open_wam.models.policy_variants.dual_expert.vrfm import configure_vrfm
