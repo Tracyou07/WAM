@@ -42,6 +42,7 @@ data:
 preparation:
   prompt_cache_root: ${GW_CINE_LATENT_ROOT}/prompt_cache
 run:
+  strategy: fsdp
   output_root: ${GW_OUTPUT_ROOT}
   steps: 2
   seed: 20261008

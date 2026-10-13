@@ -56,6 +56,7 @@ def _apply_composable_fsdp_sharding(
     *,
     mesh,
     mp_policy,
+    ignored_parameters: tuple[nn.Parameter, ...] = (),
 ) -> nn.Module:
     from torch.distributed.fsdp import fully_shard
 
@@ -76,6 +77,8 @@ def _apply_composable_fsdp_sharding(
         }
         if offload_policy is not None:
             kwargs["offload_policy"] = offload_policy
+        if ignored_parameters:
+            kwargs['ignored_params'] = set(ignored_parameters)
         return kwargs
 
     def _shard_block_stack(owner: nn.Module | None) -> None:
@@ -311,6 +314,7 @@ class DistributedStrategy(SingleDeviceStrategy):
     distributed_timeout_seconds: int = 1800
 
     def __post_init__(self) -> None:
+        self.kind = StrategyName(self.kind)
         context = self.launch_context or DistributedLaunchContext.from_env()
         self.launch_context = context
         self.rank = context.rank
@@ -356,8 +360,9 @@ class DistributedStrategy(SingleDeviceStrategy):
     def _uses_process_group(self) -> bool:
         return self.distributed or self.kind == StrategyName.FSDP
 
-    def prepare_model(self, model: nn.Module) -> nn.Module:
-        model.to(device=self.device)
+    def prepare_model(self, model: nn.Module, *, ignored_parameters=()) -> nn.Module:
+        if self.kind != StrategyName.FSDP:
+            model.to(device=self.device)
         if not self._uses_process_group:
             return model
         if self.kind == StrategyName.DDP:
@@ -369,6 +374,9 @@ class DistributedStrategy(SingleDeviceStrategy):
         if self.kind == StrategyName.FSDP:
             from torch.distributed.fsdp import MixedPrecisionPolicy
 
+            self._fsdp_replicated_parameters = tuple(ignored_parameters)
+            for parameter in self._fsdp_replicated_parameters:
+                parameter.data = parameter.data.to(self.device)
             _apply_block_activation_checkpointing(model)
             mp_policy = MixedPrecisionPolicy(cast_forward_inputs=False)
             if self.device.type == "cuda":
@@ -390,6 +398,7 @@ class DistributedStrategy(SingleDeviceStrategy):
                 model,
                 mesh=self._device_mesh,
                 mp_policy=mp_policy,
+                ignored_parameters=self._fsdp_replicated_parameters,
             )
         raise ValueError(f"Unsupported distributed strategy kind {self.kind!r}.")
 
@@ -403,7 +412,29 @@ class DistributedStrategy(SingleDeviceStrategy):
     def set_gradient_sync(self, model: nn.Module, enabled: bool) -> None:
         if not self._uses_process_group:
             return
+        if self.kind is StrategyName.FSDP and getattr(self, '_fsdp_replicated_parameters', ()):
+            # Reduce each microbatch into parameter shards, rather than keeping
+            # full-size ordinary gradients throughout the accumulation window.
+            enabled = True
         _set_gradient_sync_recursive(model, enabled)
+
+    def set_partial_backward(self, model: nn.Module, *, enabled: bool) -> None:
+        """Keep FSDP state alive for task-only backwards of one retained graph."""
+        from torch.distributed.fsdp import FSDPModule
+        for module in model.modules():
+            if isinstance(module, FSDPModule):
+                module.set_requires_gradient_sync(not enabled, recurse=False)
+                module.set_reshard_after_backward(not enabled, recurse=False)
+                module.set_is_last_backward(not enabled)
+
+    def unscale_(self, optimizer: torch.optim.Optimizer, *, synchronize_replicated=True) -> None:
+        if synchronize_replicated and self.kind is StrategyName.FSDP:
+            from .gradient_sync import synchronize_replicated_gradients
+            synchronize_replicated_gradients(
+                getattr(self, '_fsdp_replicated_parameters', ()),
+                skip_parameter_ids=set(), world_size=self.world_size,
+            )
+        super().unscale_(optimizer)
 
     def clip_grad_norm_(self, parameters, max_grad_norm: float) -> torch.Tensor:
         return _clip_grad_norm_mixed(

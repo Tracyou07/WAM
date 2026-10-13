@@ -9,7 +9,7 @@ and RM75/Cine (`gradientwam-cine`) remain available.
 | Base trainable parameters | Action expert/packed action blocks, final video K/V, native state projection | Same base scope, plus VRFM modules |
 | Initialization | Same public video checkpoint and native action initialization | Same; added VRFM initialization does not consume native RNG |
 | Data, split, preparation and interaction | Fixed shared inputs and `decoupled_same_step` program | Same |
-| Distributed strategy | DDP | DDP; CAGrad does not currently support FSDP |
+| Distributed strategy | FSDP2, with the structural shared candidate set replicated | Same FSDP2 policy; CAGrad runs on globally averaged shared gradients |
 | Actual global batch | `WORLD_SIZE * train_batch_size * gradient_accumulation_steps` | Must match |
 | Optimizer and base LR | AdamW, 1e-5 | Same |
 | Actual entry update budget | Two-update smoke | Two-update smoke; 10000 is an explicit future setting |
@@ -20,6 +20,8 @@ evaluation seeds, prepared cache and episode split. Use a different output
 directory for each arm. The example launchers default to eight ranks; this is
 a default, not a GPU reservation. Record actual topology and global batch.
 VRFM adds trainable parameters, so this is not a parameter-count-matched study.
+The bulk video/action parameters and optimizer state are sharded. See
+[FSDP controls and continuation](fsdp_training.md) for the shared-gradient policy.
 
 The primary two-arm comparison tests the combined change. The `vrfm` and
 `cagrad` configs isolate individual contributions when needed. Offline denoising
@@ -49,7 +51,11 @@ Keep the process count and effective batch equal to the saved run. Full-state
 continuation restores model, optimizer, scheduler, strategy/scaler, step state,
 rank-local RNG and sampling cursor. A model-only `model_state.pt` is for weights
 or inference, not full-state continuation. Changing the method, training scope,
-checkpoint identity, prepared data or topology is rejected.
+checkpoint identity, prepared data, distributed strategy or topology is rejected.
+New examples explicitly select `fsdp`; old YAMLs without the field still select
+DDP and keep their previous checkpoint identity. Continue those checkpoints with
+their original settings and DDP strategy. FSDP checkpoints bind the shared-gradient
+contract and `OPEN_WAM_FSDP_CPU_OFFLOAD` setting as well.
 
 The state-projection scope is explicit. Settings saved before this scope was
 added (without `train_proprio_projection`) retain the original identity and

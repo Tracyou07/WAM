@@ -196,6 +196,34 @@ def test_cine_settings_resume_identity_ignores_step_budget_and_output_root(cine_
     assert base.identity() == continued.identity()
 
 
+def test_old_cine_settings_keep_ddp_and_original_config_identity(cine_env, tmp_path):
+    from gradientwam.settings import _expand
+    from open_wam.configs.enums import StrategyName
+    import hashlib
+    import json
+
+    source = Path(__file__).parents[1] / 'configs/cine_v3/baseline.yaml'
+    config_path = _copy_cine_config(tmp_path, source)
+    raw = yaml.safe_load(config_path.read_text())
+    raw['run'].pop('strategy')
+    config_path.write_text(yaml.safe_dump(raw))
+    legacy = load_cine_settings(config_path)
+    original = _expand(raw)
+    original['run'].pop('steps')
+    original['run'].pop('output_root')
+    expected = hashlib.sha256(json.dumps(original, sort_keys=True,
+                                        separators=(',', ':'), default=str).encode()).hexdigest()
+    assert legacy.strategy is StrategyName.DDP
+    assert legacy.config_sha256 == expected
+    raw['run']['strategy'] = 'fsdp'
+    config_path.write_text(yaml.safe_dump(raw))
+    fsdp = load_cine_settings(config_path)
+    assert fsdp.strategy is StrategyName.FSDP
+    assert fsdp.identity() != legacy.identity()
+    assert fsdp.native_config() == legacy.native_config()
+    assert fsdp.method_config == legacy.method_config
+
+
 def test_cine_resume_entry_routes_identity_for_larger_step_budget_and_new_output(
     cine_env, tmp_path, monkeypatch
 ):

@@ -15,6 +15,16 @@ import tempfile
 from collections.abc import Mapping
 
 import yaml
+from open_wam.configs.enums import StrategyName
+
+
+def parse_distributed_strategy(value: object = None) -> StrategyName:
+    """Missing strategy preserves existing DDP settings and checkpoint identities."""
+    if value is None:
+        return StrategyName.DDP
+    if value not in (StrategyName.DDP, StrategyName.FSDP):
+        raise ValueError('Distributed strategy must be ddp or fsdp.')
+    return StrategyName(value)
 
 class GradientWAMMethod(str, Enum):
     BASELINE = 'baseline'
@@ -319,6 +329,7 @@ class CineSettings:
     action_normalization: str
     native: Any
     config_sha256: str
+    strategy: StrategyName = StrategyName.DDP
 
     @property
     def arm(self) -> str:
@@ -410,8 +421,9 @@ def load_cine_settings(path: Path) -> CineSettings:
         raise ValueError("Cine requires dataset_name=cine_v3 and dataset_type=cine_v3_latent.")
     if set(preparation) - {"prompt_cache_root"} or "prompt_cache_root" not in preparation:
         raise ValueError("Cine preparation requires prompt_cache_root and no unknown fields.")
-    if set(run) - {"output_root", "steps", "seed", "route_seed", "eval_seed"}:
-        raise ValueError(f"Unknown Cine run fields: {sorted(set(run) - {'output_root', 'steps', 'seed', 'route_seed', 'eval_seed'})}.")
+    if set(run) - {"output_root", "steps", "seed", "route_seed", "eval_seed", "strategy"}:
+        raise ValueError(f"Unknown Cine run fields: {sorted(set(run) - {'output_root', 'steps', 'seed', 'route_seed', 'eval_seed', 'strategy'})}.")
+    strategy = parse_distributed_strategy(run.get('strategy'))
     if not {"output_root", "steps", "seed"} <= set(run):
         raise ValueError("Cine run requires output_root, steps, and seed.")
     if type(run["steps"]) is not int or run["steps"] <= 0:
@@ -538,4 +550,5 @@ def load_cine_settings(path: Path) -> CineSettings:
         action_normalization=normalization,
         native=native,
         config_sha256=config_digest,
+        strategy=strategy,
     )

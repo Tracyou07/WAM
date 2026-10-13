@@ -106,16 +106,18 @@ class _NativeCAGradStepExecutor(_ToyStepExecutor):
             'proprio_context_frames_mask': torch.ones_like(actions),
         })
         text = observations.reshape(-1, 1, 1).expand(-1, 3, 16).contiguous()
-        result = self.pipeline.forward_train_from_latents(latents, native_batch, text_context=text)
+        result = self.pipeline(video_latents=latents, batch=native_batch, text_context=text)
         decoder = result.decoder_output
-        return SimpleNamespace(loss=decoder.loss, metrics=decoder.metrics,
+        return SimpleNamespace(loss=decoder.loss, metrics=decoder.metrics, output=result,
                                task_losses=decoder.aux['task_losses'],
                                task_active={'video': True, 'action': True})
 
 
 def _assert_nested_equal(expected, actual):
     if isinstance(expected, torch.Tensor):
-        assert torch.equal(expected, actual)
+        left = expected.to_local() if hasattr(expected, 'to_local') else expected
+        right = actual.to_local() if hasattr(actual, 'to_local') else actual
+        assert torch.equal(left, right)
     elif isinstance(expected, dict):
         assert expected.keys() == actual.keys()
         for key in expected:
@@ -145,7 +147,9 @@ def _free_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _worker(rank: int, world_size: int, port: int, root: str, actual_native: bool = False) -> None:
+def _worker(rank: int, world_size: int, port: int, root: str, actual_native: bool = False,
+            strategy_kind: str = 'ddp', accelerator: str = 'cpu', method: str = 'vrfm_cagrad',
+            mixed_precision: bool = False) -> None:
     os.environ.update(
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
@@ -192,11 +196,11 @@ def _worker(rank: int, world_size: int, port: int, root: str, actual_native: boo
 
     context = DistributedLaunchContext.from_env()
     strategy = DistributedStrategy(
-        accelerator=TrainerAccelerator.CPU,
-        precision=TrainerPrecision.FP32,
-        kind=StrategyName.DDP,
+        accelerator=TrainerAccelerator(accelerator),
+        precision=TrainerPrecision.BF16 if mixed_precision else TrainerPrecision.FP32,
+        kind=StrategyName(strategy_kind),
         launch_context=context,
-        distributed_timeout_seconds=60,
+        distributed_timeout_seconds=180 if accelerator == 'gpu' else 60,
     )
     checkpoint_root = Path(root) / "checkpoints"
     output_dir = Path(root)
@@ -208,7 +212,10 @@ def _worker(rank: int, world_size: int, port: int, root: str, actual_native: boo
         "global_batch_size": world_size * 2,
     }
     if actual_native:
-        identity.update(method='vrfm_cagrad', trainability_scope='native_action_final_video_kv_hidden_proprio_v2')
+        identity.update(method=method, strategy=strategy_kind,
+                        trainability_scope='native_action_final_video_kv_hidden_proprio_v2')
+    from gradientwam.runtime_factory import _distributed_checkpoint_identity
+    identity = _distributed_checkpoint_identity(identity, StrategyName(strategy_kind))
     total_steps = 3 if actual_native else 2
 
     def make_runtime(init_seed: int):
@@ -224,14 +231,28 @@ def _worker(rank: int, world_size: int, port: int, root: str, actual_native: boo
             from open_wam.models.policy_variants.dual_expert.vrfm import configure_vrfm
 
             plain, *_ = fixture()
+            if accelerator == 'gpu' or strategy_kind == 'fsdp':
+                from open_wam.pipelines import build_variant_pipeline_from_config
+                *_, fixture_config = fixture(return_config=True)
+                # Head 32 supports CUDA FlexAttention and the native 3-axis RoPE split.
+                plain = build_variant_pipeline_from_config(replace(fixture_config,
+                    backbone=replace(fixture_config.backbone, hidden_size=64, num_heads=2,
+                                     attention_head_dim=32, ffn_dim=128),
+                    policy_variant=replace(fixture_config.policy_variant, hidden_size=64,
+                                           use_activation_checkpointing=True),
+                    action_decoder=replace(fixture_config.action_decoder, hidden_size=64)))
             trainability_audit = configure_native_trainability(
                 plain, expected_layers=2, train_proprio_projection=True,
             )
-            configure_vrfm(plain, latent_dim=4, kl_weight=.01)
-            method_config = GradientWAMMethodConfig(method=GradientWAMMethod.VRFM_CAGRAD,
+            if method == 'vrfm_cagrad':
+                configure_vrfm(plain, latent_dim=4, kl_weight=.01)
+            method_config = GradientWAMMethodConfig(method=GradientWAMMethod(method),
                 latent_dim=4, kl_weight=.01, train_proprio_projection=True)
+            from gradientwam.runtime_factory import _configure_cagrad_compilation
+            _configure_cagrad_compilation(method_config)
             cagrad_candidates = cagrad_candidate_parameters(plain)
-        model = strategy.prepare_model(plain)
+        model = (strategy.prepare_model(plain, ignored_parameters=cagrad_candidates)
+                 if strategy_kind == 'fsdp' else strategy.prepare_model(plain))
         dataset = EpisodeSubset(_ToyDataset(), list(range(16)), seed=441)
         native_sampler = LocalLatentWeightedTrainSampler(
             dataset, world_size=world_size, rank=rank
@@ -240,13 +261,14 @@ def _worker(rank: int, world_size: int, port: int, root: str, actual_native: boo
         loader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=0)
         config = ExperimentConfig(
             training=TrainingConfig(
-                gradient_accumulation_steps=2, max_grad_norm=None, num_steps=total_steps
+                gradient_accumulation_steps=2, max_grad_norm=None, num_steps=total_steps,
+                learning_rate=.02, beta2=.999, weight_decay=.01,
             ),
             trainer=TrainerConfig(
-                accelerator=TrainerAccelerator.CPU,
+                accelerator=TrainerAccelerator(accelerator),
                 devices=world_size,
-                precision=TrainerPrecision.FP32,
-                strategy=StrategyName.DDP,
+                precision=TrainerPrecision.BF16 if mixed_precision else TrainerPrecision.FP32,
+                strategy=StrategyName(strategy_kind),
                 loop_policy=LoopPolicyName.STEPS,
                 enable_checkpointing=True,
                 checkpoint_mode=CheckpointMode.FULL_TRAINING_STATE,
@@ -257,8 +279,10 @@ def _worker(rank: int, world_size: int, port: int, root: str, actual_native: boo
                 distributed_timeout_seconds=60,
             ),
         )
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.02)
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+        from open_wam.training.optim import build_optimizer
+        optimizer = build_optimizer(model, config.training)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, (lambda step: 1. / (1 + step)) if actual_native else (lambda _: 1.))
         manager = CheckpointManager(
             root_dir=checkpoint_root,
             config=config,
@@ -295,7 +319,7 @@ def _worker(rank: int, world_size: int, port: int, root: str, actual_native: boo
         return runtime, adapter
 
     live_runtime, live = make_runtime(900)
-    initial_parameters = {
+    initial_parameters = {} if actual_native else {
         name: value.detach().cpu().clone()
         for name, value in strategy.unwrap_model(live.model).state_dict().items()
     }
@@ -359,13 +383,13 @@ def _worker(rank: int, world_size: int, port: int, root: str, actual_native: boo
         with pytest.raises(ValueError, match='identity'):
             rejected.resume(str(checkpoint_step1))
 
-    expected_parameters = [
-        value.detach().clone() for value in strategy.unwrap_model(live.model).parameters()
-    ]
-    actual_parameters = [
-        value.detach().clone()
-        for value in strategy.unwrap_model(resumed.model).parameters()
-    ]
+    def full_parameter(value):
+        value = value.full_tensor() if hasattr(value, 'full_tensor') else value
+        return value.detach().cpu().clone()
+    expected_parameters = [full_parameter(value)
+                           for value in strategy.unwrap_model(live.model).parameters()]
+    actual_parameters = [full_parameter(value)
+                         for value in strategy.unwrap_model(resumed.model).parameters()]
     if any(
         not torch.equal(expected, actual)
         for expected, actual in zip(expected_parameters, actual_parameters, strict=True)
@@ -374,11 +398,17 @@ def _worker(rank: int, world_size: int, port: int, root: str, actual_native: boo
 
     all_parameters: list[list[torch.Tensor] | None] = [None] * world_size
     dist.all_gather_object(all_parameters, actual_parameters)
-    if any(
-        not torch.equal(all_parameters[0][index], all_parameters[1][index])
-        for index in range(len(actual_parameters))
-    ):
-        raise AssertionError("DDP parameters diverged after resumed training")
+    if any(not torch.equal(all_parameters[0][index], replica[index])
+           for replica in all_parameters[1:] for index in range(len(actual_parameters))):
+        raise AssertionError("distributed parameters diverged after resumed training")
+
+    if actual_native:
+        resumed.heldout_episode_ids = [0, 1]
+        heldout = resumed._evaluate_heldout()
+        assert resumed.model.training
+        if rank == 0:
+            assert heldout['heldout_sample_count'] == 2
+            assert all(np.isfinite(value) for value in heldout['metrics'].values())
 
     if rank == 0:
         (output_dir / "result.json").write_text(
@@ -392,7 +422,10 @@ def _worker(rank: int, world_size: int, port: int, root: str, actual_native: boo
                     "rank_rng_and_sampler_state_restored": True,
                     "resumed_update_matches_uninterrupted": True,
                     "optimizer_and_scheduler_match": True,
+                    "heldout_prior_evaluation_passed": actual_native,
                     "native_vrfm_cagrad": actual_native,
+                    "strategy": strategy_kind,
+                    "precision": str(strategy.precision),
                 },
                 indent=2,
             )

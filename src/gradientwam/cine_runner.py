@@ -219,7 +219,7 @@ def _build_cine_runtime(settings: CineSettings, *, resume: str | None):
         accelerator=TrainerAccelerator.GPU,
         devices=context.world_size,
         precision=TrainerPrecision.BF16,
-        strategy=StrategyName.DDP,
+        strategy=settings.strategy,
         loop_policy=LoopPolicyName.STEPS,
         enable_checkpointing=True,
         checkpoint_mode=CheckpointMode.FULL_TRAINING_STATE,
