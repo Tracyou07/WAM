@@ -96,3 +96,5 @@ contracts. Counts from overlapping runs are not additive. The earlier CUDA
 run's four native recovery checks passed; its separate masked-rank fixture
 failed before executing because a required topology argument was missing.
 That fixture is fixed and passed the actual CPU FSDP oracle above.
+CUDA continuation combining CPU offload with the new replicated candidates has
+not been executed; default no-offload recovery is the validated path.
