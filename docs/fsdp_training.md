@@ -82,8 +82,10 @@ Restarting at step one through step three matched uninterrupted model tensors,
 Adam state, scheduler, rank-local RNG, next batches/noise and rank agreement.
 These are synthetic two-layer fixtures, not full-width A100 memory measurements.
 Three-rank Gloo tests also execute real CPU FSDP2 with activation checkpointing
-enabled and a changing learning-rate scheduler. Both methods and FP32/BF16
-training/recovery and native prior-only heldout evaluation pass. An independent dense global-batch oracle matches CAGrad
+enabled and a changing learning-rate scheduler. Both methods pass recovery and
+native prior-only heldout evaluation with FP32 and BF16 strategy configuration.
+The CPU strategy computes in FP32 for both configuration variants; actual BF16
+execution was checked in the earlier CUDA run. An independent dense global-batch oracle matches CAGrad
 coefficients, replicated and sharded gradients, global clipping norm and AdamW
 updates when the action objective is inactive on one rank. Repeating the added
 activation-checkpointing and masked-rank checks under CUDA is pending GPU availability.

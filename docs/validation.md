@@ -4,8 +4,9 @@
 
 The final targeted CPU regression passed **229 tests, 55 skipped in 146.91 s**
 on the pinned PyTorch 2.11.0+cu128 environment with CUDA hidden. This includes
-actual three-rank Gloo FSDP2 baseline/VRFM+CAGrad continuation in FP32/BF16,
-activation checkpointing, a changing scheduler, exact model/Adam/RNG/sampler
+actual three-rank Gloo FSDP2 baseline/VRFM+CAGrad continuation under both FP32
+and BF16 strategy settings (CPU execution is FP32), activation checkpointing,
+a changing scheduler, exact model/Adam/RNG/sampler
 restoration, all-rank parameter agreement and native prior-only heldout evaluation.
 An independent dense global-batch oracle matches shared CAGrad coefficients,
 replicated/sharded gradients, global clipping and AdamW updates with an inactive
