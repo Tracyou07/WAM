@@ -10,9 +10,10 @@ from torch import nn
 
 from open_wam.configs.enums import CurrentBlockCoupling, HistoryStreamVisibility
 
+from open_wam.training.gradient_sync import synchronize_replicated_gradients as _synchronize_ordinary_gradients
+
 from .cagrad import cagrad_coefficients
 from .settings import TRAINABILITY_SCOPE_ID, PROPRIO_TRAINABILITY_SCOPE_ID
-_GRADIENT_BUCKET_ELEMENTS = 4_000_000
 _DOT_CHUNK_ELEMENTS = 1_000_000
 
 
@@ -174,17 +175,27 @@ class CAGradGradientAccumulator:
         task_active: Mapping[str, bool],
         *,
         scale: float,
+        include_inactive_tasks: bool = False,
     ) -> None:
+        if include_inactive_tasks and dist.is_initialized():
+            # All ranks must traverse the same task graph sequence under FSDP.
+            graph_counts = torch.tensor([int(task_losses[name].requires_grad)
+                for name in ('video', 'action')], device=self.candidates[0].device)
+            dist.all_reduce(graph_counts)
+            world_size = dist.get_world_size()
+            if any(count not in (0, world_size) for count in graph_counts.tolist()):
+                raise ValueError('FSDP task graphs must exist on every rank, including masked tasks.')
         for index, name in enumerate(("video", "action")):
-            if not task_active[name]:
+            active = bool(task_active[name])
+            if not active and not include_inactive_tasks:
                 continue
             loss = task_losses[name]
             if not loss.requires_grad:
                 continue
-            self.active[index] = True
+            self.active[index] = self.active[index] or active
             buffers = self.video_grads if index == 0 else self.action_grads
             saved_grads = [parameter.grad for parameter in self.candidates]
-            self._active_task = index
+            self._active_task = index if active else None
             try:
                 for parameter, buffer in zip(self.candidates, buffers, strict=True):
                     parameter.grad = buffer
@@ -192,7 +203,8 @@ class CAGradGradientAccumulator:
                 # task buffers. This avoids allocating a full extra gradient
                 # tuple for models with billions of trainable parameters.
                 torch.autograd.backward(
-                    loss * float(scale), inputs=self.candidates, retain_graph=True
+                    loss * (float(scale) if active else 0.),
+                    inputs=self.candidates, retain_graph=True
                 )
             finally:
                 for parameter, grad in zip(self.candidates, saved_grads, strict=True):
@@ -281,68 +293,3 @@ def _common_gram(
             dots[2] += torch.dot(right, right)
     vv, va, aa = (float(value) for value in dots.cpu().tolist())
     return ((vv, va), (va, aa))
-
-
-def _synchronize_ordinary_gradients(
-    parameters: Iterable[nn.Parameter],
-    *,
-    skip_parameter_ids: set[int],
-    world_size: int,
-) -> None:
-    selected = [
-        parameter
-        for parameter in parameters
-        if parameter.requires_grad and id(parameter) not in skip_parameter_ids
-    ]
-    if not selected or world_size <= 1:
-        return
-    device = selected[0].device
-    presence = torch.tensor(
-        [parameter.grad is not None for parameter in selected],
-        device=device,
-        dtype=torch.int32,
-    )
-    dist.all_reduce(presence, op=dist.ReduceOp.SUM)
-    active_parameters = [
-        parameter for parameter, active in zip(selected, presence.tolist(), strict=True)
-        if active > 0
-    ]
-    for parameter in active_parameters:
-        if parameter.grad is None:
-            parameter.grad = torch.zeros_like(parameter)
-        elif not parameter.grad.is_contiguous():
-            parameter.grad = parameter.grad.contiguous()
-
-    views: list[torch.Tensor] = []
-    references: list[tuple[nn.Parameter, int, int]] = []
-    bucket_numel = 0
-
-    def reduce_bucket() -> None:
-        nonlocal bucket_numel
-        if not views:
-            return
-        bucket = torch.cat(views)
-        dist.all_reduce(bucket, op=dist.ReduceOp.SUM)
-        bucket.div_(world_size)
-        cursor = 0
-        for parameter, start, end in references:
-            length = end - start
-            parameter.grad.view(-1)[start:end].copy_(bucket[cursor : cursor + length])
-            cursor += length
-        views.clear()
-        references.clear()
-        bucket_numel = 0
-
-    for parameter in active_parameters:
-        flat = parameter.grad.view(-1)
-        start = 0
-        while start < flat.numel():
-            take = min(_GRADIENT_BUCKET_ELEMENTS - bucket_numel, flat.numel() - start)
-            end = start + take
-            views.append(flat[start:end])
-            references.append((parameter, start, end))
-            bucket_numel += take
-            start = end
-            if bucket_numel == _GRADIENT_BUCKET_ELEMENTS:
-                reduce_bucket()
-    reduce_bucket()

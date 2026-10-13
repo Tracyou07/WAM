@@ -3,12 +3,26 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+import os
 import random
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from open_wam.configs.enums import StrategyName
+
+
+def _distributed_checkpoint_identity(identity: dict[str, Any], strategy: StrategyName) -> dict[str, Any]:
+    if strategy is not StrategyName.FSDP:
+        return identity
+    return {
+        **identity,
+        'fsdp_contract': {
+            'version': 'replicated_common_v1',
+            'cpu_offload': os.environ.get('OPEN_WAM_FSDP_CPU_OFFLOAD', '0') == '1',
+        },
+    }
 
 
 def _configure_cagrad_compilation(method_config: Any) -> None:
@@ -53,6 +67,7 @@ def build_rank_aware_runtime(
     from .distributed_train import RankAwareTrainingRuntime
 
     try:
+        identity = _distributed_checkpoint_identity(identity, config.trainer.strategy)
         _configure_cagrad_compilation(settings.method_config)
         seed = int(settings.seed)
         random.seed(seed)
@@ -112,7 +127,7 @@ def build_rank_aware_runtime(
                     latent_dim=settings.method_config.latent_dim,
                     kl_weight=settings.method_config.kl_weight,
                 )
-            if settings.method_config.uses_cagrad:
+            if settings.method_config.uses_cagrad or getattr(strategy, 'kind', None) is StrategyName.FSDP:
                 cagrad_candidates = cagrad_candidate_parameters(model)
 
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
@@ -124,7 +139,10 @@ def build_rank_aware_runtime(
             total_parameters=parameter_count,
             trainable_parameters=trainable_count,
         )
-        model = strategy.prepare_model(model)
+        if getattr(strategy, 'kind', None) is StrategyName.FSDP:
+            model = strategy.prepare_model(model, ignored_parameters=cagrad_candidates)
+        else:
+            model = strategy.prepare_model(model)
         rank_seed = seed + int(strategy.rank)
         random.seed(rank_seed)
         np.random.seed(rank_seed % (2**32))

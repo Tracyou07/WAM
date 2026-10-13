@@ -1,5 +1,36 @@
 # Delivery validation
 
+## Paired FSDP2 revision (2026-10-13)
+
+The final targeted CPU regression passed **229 tests, 55 skipped in 146.91 s**
+on the pinned PyTorch 2.11.0+cu128 environment with CUDA hidden. This includes
+actual three-rank Gloo FSDP2 baseline/VRFM+CAGrad continuation in FP32/BF16,
+activation checkpointing, a changing scheduler, exact model/Adam/RNG/sampler
+restoration, all-rank parameter agreement and native prior-only heldout evaluation.
+An independent dense global-batch oracle matches shared CAGrad coefficients,
+replicated/sharded gradients, global clipping and AdamW updates with an inactive
+task on one rank. Both data-entry settings and the quickstart's generated run
+YAML are covered; old DDP continuation remains green.
+
+Earlier three-rank NCCL native FP32/BF16 recovery tests passed for both arms.
+Those runs predate enabling the native internal activation-checkpointing flag
+in the fixture. The added CUDA checkpointing/masked-rank oracle checks await
+free GPUs. No full-width 8xA100 40 GB run or memory-fit claim is made. Detailed
+configuration and compatibility limits are in [FSDP training](fsdp_training.md).
+
+```bash
+CUDA_VISIBLE_DEVICES='' HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONPATH=src \
+python -m pytest tests/test_gradientwam_fsdp.py tests/test_gradientwam_distributed.py \
+  tests/test_gradientwam_training_methods.py tests/test_gradientwam_paired_recipes.py \
+  tests/test_gradientwam_vrfm_cagrad_settings.py tests/test_gradientwam_delivery.py \
+  tests/test_gradientwam_heldout.py tests/test_cine_training_entry.py \
+  tests/test_training_strategies.py tests/test_training_runtime.py \
+  tests/test_training_precision.py tests/test_sequence_batch_fsdp.py \
+  tests/test_checkpoint_runtime.py tests/test_checkpoint_protocol.py \
+  tests/test_checkpoint_artifacts.py -q
+```
+
 ## Current VRFM + CAGrad revision (2026-10-09)
 
 Validation below concerns engineering behavior, not control quality. The new method changes native model/training files; the historical byte-identical snapshot statement further below does not apply to this revision.

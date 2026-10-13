@@ -628,16 +628,17 @@ class RankAwareTrainingRuntime:
             from .cagrad_training import CAGradGradientAccumulator
             from open_wam.configs.enums import StrategyName
 
-            if getattr(self.strategy, "kind", None) != StrategyName.DDP:
-                raise ValueError("CAGrad requires the GradientWAM DDP strategy")
+            if getattr(self.strategy, "kind", None) not in (StrategyName.DDP, StrategyName.FSDP):
+                raise ValueError("CAGrad requires the GradientWAM DDP or FSDP strategy")
             if not cagrad_candidates:
                 raise ValueError("CAGrad method requires a nonempty structural candidate set")
             self.cagrad_candidates = tuple(cagrad_candidates)
             self._cagrad_accumulator = CAGradGradientAccumulator(
                 self.cagrad_candidates, c=method_config.cagrad_c
             )
-            # CAGrad owns the only synchronization for this path. Forward the
-            # underlying module so DDP reducer hooks cannot sync partial/task grads.
+            # CAGrad synchronizes replicated leaves; FSDP owns sharded gradients.
+            # Unwrap DDP to avoid its reducer during task-only backwards. FSDP2
+            # is applied in-place and keeps its forward hooks on this module.
             self.step_executor.pipeline = self.strategy.unwrap_model(self.model)
             runtime._train_micro_step = self._train_micro_step
 
@@ -660,13 +661,22 @@ class RankAwareTrainingRuntime:
             raise ValueError("CAGrad requires graph-bearing task losses and native activity masks")
         scaler = getattr(self.strategy, "grad_scaler", None)
         scale = float(scaler.get_scale()) if scaler is not None and scaler.is_enabled() else 1.0
-        self._cagrad_accumulator.accumulate(
-            result.task_losses,
-            result.task_active,
-            scale=scale / accumulation_steps,
-        )
-        # The executor's pipeline is unwrapped, so this backward never enters
-        # DDP's reducer; the accumulated ordinary and task gradients are averaged below.
+        from open_wam.configs.enums import StrategyName
+        fsdp = getattr(self.strategy, 'kind', None) is StrategyName.FSDP
+        if fsdp:
+            self.strategy.set_partial_backward(self.model, enabled=True)
+        try:
+            self._cagrad_accumulator.accumulate(
+                result.task_losses,
+                result.task_active,
+                scale=scale / accumulation_steps,
+                include_inactive_tasks=fsdp,
+            )
+        finally:
+            if fsdp:
+                self.strategy.set_partial_backward(self.model, enabled=False)
+        # DDP uses explicit reduction below. FSDP reduce-scatters ordinary
+        # gradients while the small replicated task buffers remain local.
         self.strategy.backward(loss)
         self.train_state.global_step += 1
         self.train_state.seen_batches += 1
@@ -675,7 +685,12 @@ class RankAwareTrainingRuntime:
             return
 
         cagrad_report = self._cagrad_accumulator.finalize(self.model.parameters())
-        self.strategy.unscale_(self.optimizer)
+        if fsdp:
+            # finalize already synchronized the replicated ordinary gradients;
+            # FSDP reduced sharded gradients during the ordinary backward.
+            self.strategy.unscale_(self.optimizer, synchronize_replicated=False)
+        else:
+            self.strategy.unscale_(self.optimizer)
         if self.config.training.max_grad_norm is not None:
             grad_norm = self.strategy.clip_grad_norm_(
                 self.model.parameters(), self.config.training.max_grad_norm
@@ -777,7 +792,7 @@ class RankAwareTrainingRuntime:
             name="run_start",
             payload={
                 "run_name": self.train_state.run_name,
-                "strategy": "ddp",
+                "strategy": str(self.config.trainer.strategy),
                 "world_size": self.strategy.world_size,
                 "heldout_split": getattr(self, "heldout_split_label", "episode_split_json"),
             },
@@ -944,6 +959,10 @@ def _build_runtime(spec_path: Path, *, resume: str | None):
     from .settings import load_settings
 
     settings = load_settings(settings_path)
+    from .settings import parse_distributed_strategy
+    distributed_strategy = parse_distributed_strategy(spec.get('strategy'))
+    if distributed_strategy is StrategyName.FSDP and settings.method_config.legacy_v02:
+        raise ValueError('Historical legacy_v02 continuation requires ddp.')
     context = DistributedLaunchContext.from_env()
     if context.environment is not LaunchEnvironment.TORCH_DISTRIBUTED:
         raise ValueError("Launch with torchrun; implicit single-process fallback is disabled")
@@ -959,7 +978,7 @@ def _build_runtime(spec_path: Path, *, resume: str | None):
         accelerator=TrainerAccelerator.GPU,
         devices=context.world_size,
         precision=TrainerPrecision.BF16,
-        strategy=StrategyName.DDP,
+        strategy=distributed_strategy,
         loop_policy=LoopPolicyName.STEPS,
         enable_checkpointing=True,
         checkpoint_mode=CheckpointMode.FULL_TRAINING_STATE,

@@ -9,7 +9,7 @@ Requires the installed environment and GW_* asset/output paths from README.
 Checks config, optionally prepares the explicit split, checks data, then trains
 with the native synchronized entrypoint and reports heldout denoising proxies.
 
-Environment: NPROC_PER_NODE=8, TRAIN_STEPS=2,
+Environment: NPROC_PER_NODE=8, TRAIN_STEPS=2, TRAIN_STRATEGY=fsdp (or ddp),
 PREPARE=0 (set 1 to explicitly encode into a fresh GW_PREPARATION_ROOT),
 PREPARE_DEVICE=cpu, CHECK_ONLY=0 (set 1 to stop before GPU/model construction),
 RESUME_CHECKPOINT= (matching trusted full-state checkpoint directory or file).
@@ -55,10 +55,14 @@ import yaml
 steps = int(os.environ.get('TRAIN_STEPS', '2'))
 if steps <= 0:
     raise SystemExit('TRAIN_STEPS must be a positive integer.')
+strategy = os.environ.get('TRAIN_STRATEGY', 'fsdp')
+if strategy not in ('ddp', 'fsdp'):
+    raise SystemExit('TRAIN_STRATEGY must be ddp or fsdp.')
 Path(sys.argv[1]).write_text(yaml.safe_dump({
     'settings_config': sys.argv[2],
     'episode_split_json': sys.argv[3],
     'steps': steps,
+    'strategy': strategy,
     'eval_seed': 20261009,
 }), encoding='utf-8')
 PY

@@ -2,7 +2,7 @@
 
 `gradientwam-cine` targets the RM75/Cine LeRobot v3 dataset. The existing `gradientwam` LIBERO commands and configurations remain available. Both entries share OpenWAM, the four method choices, CAGrad gradient coordination and the native training runtime.
 
-The shipped methods use the same bounded DDP base scope, including the native
+The shipped methods use FSDP2 with the same bounded base scope, including the native
 state projection. Their `run.steps: 2` is the actual smoke budget; a formal
 10000-update comparison requires explicitly setting both runs to that budget.
 Keep the original settings when resuming older checkpoints with frozen state
@@ -65,7 +65,7 @@ Action normalization defaults to `none`. With `data.adapter_options.action_norma
 
 ## Train, validate and continue
 
-The four settings files are `baseline.yaml`, `vrfm.yaml`, `cagrad.yaml` and `vrfm_cagrad.yaml` under `configs/cine_v3/`. Start with their two-update budget, then explicitly set `run.steps` for the intended experiment.
+The four settings files are `baseline.yaml`, `vrfm.yaml`, `cagrad.yaml` and `vrfm_cagrad.yaml` under `configs/cine_v3/`. They select `run.strategy: fsdp`. Start with their two-update budget, then explicitly set `run.steps` for the intended experiment. Existing custom files without `run.strategy` retain DDP; add the field explicitly for a new FSDP run.
 
 ```bash
 # Checks the cache, launches synchronized training and reports heldout proxies.
@@ -80,7 +80,7 @@ RESUME_CHECKPOINT=/absolute/runs/cine-vrfm-cagrad-001/checkpoints/checkpoint_ste
   NPROC_PER_NODE=8 bash scripts/train_cine.sh "$CFG"
 ```
 
-Any positive process count is supported by the launcher; select only free physical GPUs. DDP replicates the model on every rank, so additional GPUs do not pool their memory. Actual full-model fit and throughput must be measured. Keep process count, global batch, selected cache and update budget equal across method comparisons.
+Any positive process count is supported by the launcher; select only free physical GPUs. FSDP2 shards the bulk model and optimizer state while keeping the small CAGrad candidate subset replicated. Actual full-model fit and throughput must be measured. Keep strategy, process count, global batch, selected cache and update budget equal across method comparisons. See [FSDP training and resume](fsdp_training.md).
 
 The declared training action horizon is 36. The native model factory requires a matching decoder horizon; the inference profile therefore uses nine latent frames per chunk and four action slots per latent. Training uses the separately declared chunked attention geometry. These settings are an explicit Cine adaptation, not a reproduction of the archived FastWAM recipe.
 
